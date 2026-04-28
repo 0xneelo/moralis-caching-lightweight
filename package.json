@@ -1,0 +1,13 @@
+{
+  "name": "moralis-charting-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix moralisCacheSystem run dev:local",
+    "dev:local": "npm --prefix moralisCacheSystem run dev:local",
+    "dev:docker": "npm --prefix moralisCacheSystem run dev:docker",
+    "stop": "powershell -ExecutionPolicy Bypass -File .\\stop-dev.ps1",
+    "test": "npm --prefix moralisCacheSystem test",
+    "test:e2e:full": "npm --prefix moralisCacheSystem run test:e2e:full"
+  }
+}
