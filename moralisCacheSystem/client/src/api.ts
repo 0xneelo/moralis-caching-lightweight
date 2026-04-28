@@ -52,6 +52,13 @@ export type MoralisUsage = {
   updatedAt: string;
 };
 
+export type PairMetadata = {
+  label: string;
+  baseSymbol?: string;
+  quoteSymbol?: string;
+  dexId?: string;
+};
+
 export async function fetchChartCandles(params: ChartRequest) {
   const url = new URL('/api/charts/ohlcv', window.location.origin);
   url.searchParams.set('chain', params.chain);
@@ -83,6 +90,56 @@ export async function fetchMoralisUsage() {
   }
 
   return (await response.json()) as MoralisUsage;
+}
+
+export async function fetchPairMetadata(params: {
+  chainSlug: string;
+  pairAddress: string;
+}) {
+  const response = await fetch(
+    `https://api.dexscreener.com/latest/dex/pairs/${params.chainSlug}/${params.pairAddress}`
+  );
+
+  if (!response.ok) {
+    throw new Error(`Pair metadata request failed with ${response.status}`);
+  }
+
+  const data = (await response.json()) as {
+    pair?: {
+      dexId?: string;
+      baseToken?: {
+        symbol?: string;
+      };
+      quoteToken?: {
+        symbol?: string;
+      };
+    };
+  };
+
+  const baseSymbol = data.pair?.baseToken?.symbol;
+  const quoteSymbol = data.pair?.quoteToken?.symbol;
+
+  if (!baseSymbol && !quoteSymbol) {
+    throw new Error('Pair metadata response did not include token symbols');
+  }
+
+  const metadata: PairMetadata = {
+    label: [baseSymbol, quoteSymbol].filter(Boolean).join(' / '),
+  };
+
+  if (baseSymbol) {
+    metadata.baseSymbol = baseSymbol;
+  }
+
+  if (quoteSymbol) {
+    metadata.quoteSymbol = quoteSymbol;
+  }
+
+  if (data.pair?.dexId) {
+    metadata.dexId = data.pair.dexId;
+  }
+
+  return metadata;
 }
 
 export function getRangeWindow(range: ChartRange) {

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { ChartPanel } from './ChartPanel';
 import {
   fetchChartCandles,
+  fetchPairMetadata,
   fetchMoralisUsage,
   getMinimumTimeframeForRange,
   getRangeWindow,
@@ -10,6 +11,7 @@ import {
   type ChartRange,
   type ChartResponse,
   type MoralisUsage,
+  type PairMetadata,
   type Timeframe,
 } from './api';
 import { chainOptions, getChainLabel, getDexscreenerChainSlug } from './chains';
@@ -33,12 +35,15 @@ export function App() {
   const [slippage, setSlippage] = useState(10);
   const [response, setResponse] = useState<ChartResponse | null>(null);
   const [usage, setUsage] = useState<MoralisUsage | null>(null);
+  const [pairMetadata, setPairMetadata] = useState<PairMetadata | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const lastCandle = response?.candles.at(-1);
   const previousCandle = response?.candles.at(-2);
-  const dexscreenerUrl = `https://dexscreener.com/${getDexscreenerChainSlug(chain)}/${pairAddress}`;
+  const chainSlug = getDexscreenerChainSlug(chain);
+  const dexscreenerUrl = `https://dexscreener.com/${chainSlug}/${pairAddress}`;
+  const pairLabel = pairMetadata?.label ?? `${shortenAddress(pairAddress)} / ${getChainLabel(chain)}`;
   const priceChange = useMemo(() => {
     if (!lastCandle || !previousCandle) {
       return 0;
@@ -82,6 +87,37 @@ export function App() {
 
     return () => controller.abort();
   }, [chain, pairAddress, timeframe, chartRange]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadPairMetadata() {
+      setPairMetadata(null);
+
+      try {
+        const metadata = await fetchPairMetadata({
+          chainSlug,
+          pairAddress,
+        });
+
+        if (!cancelled) {
+          setPairMetadata(metadata);
+        }
+      } catch {
+        if (!cancelled) {
+          setPairMetadata(null);
+        }
+      }
+    }
+
+    if (pairAddress.trim()) {
+      void loadPairMetadata();
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [chainSlug, pairAddress]);
 
   useEffect(() => {
     let cancelled = false;
@@ -135,7 +171,7 @@ export function App() {
       <section className="ticker-tape" aria-label="market tape">
         {[
           ['Market', getChainLabel(chain)],
-          ['VYM', lastCandle ? `$${lastCandle.close.toFixed(8)}` : 'loading'],
+          [pairMetadata?.baseSymbol ?? 'Pair', lastCandle ? `$${lastCandle.close.toFixed(8)}` : 'loading'],
           ['Source', response?.source ?? 'none'],
           ['Candles', String(response?.candles.length ?? 0)],
           ['Moralis CU', usage ? `${usage.todayCu.toLocaleString()} today` : 'loading'],
@@ -161,7 +197,7 @@ export function App() {
             <div className="pair-title">
               <span className="token-dot" />
               <div>
-                <strong>VYM / {getChainLabel(chain).toUpperCase()}</strong>
+                <strong>{pairLabel}</strong>
                 <small>{pairAddress.slice(0, 6)}...{pairAddress.slice(-4)}</small>
               </div>
             </div>
@@ -277,4 +313,14 @@ export function App() {
       </section>
     </main>
   );
+}
+
+function shortenAddress(value: string) {
+  const trimmed = value.trim();
+
+  if (trimmed.length <= 12) {
+    return trimmed || 'Pair';
+  }
+
+  return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`;
 }
