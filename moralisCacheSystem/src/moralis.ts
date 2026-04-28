@@ -79,11 +79,11 @@ export async function fetchMoralisOhlcv(params: {
       break;
     }
 
-    const url = new URL(
-      `https://deep-index.moralis.io/api/v2.2/pairs/${params.pairAddress}/ohlcv`
-    );
+    const url = buildMoralisOhlcvUrl(params.chain, params.pairAddress);
 
-    url.searchParams.set('chain', params.chain);
+    if (params.chain !== 'solana') {
+      url.searchParams.set('chain', params.chain);
+    }
     url.searchParams.set('timeframe', params.timeframe);
     url.searchParams.set('currency', params.currency);
     url.searchParams.set('fromDate', params.fromDate.toISOString());
@@ -129,4 +129,12 @@ export async function fetchMoralisOhlcv(params: {
     durationMs: Date.now() - startedAt,
     truncated: Boolean(cursor),
   };
+}
+
+function buildMoralisOhlcvUrl(chain: string, pairAddress: string) {
+  if (chain === 'solana') {
+    return new URL(`https://solana-gateway.moralis.io/token/mainnet/pairs/${pairAddress}/ohlcv`);
+  }
+
+  return new URL(`https://deep-index.moralis.io/api/v2.2/pairs/${pairAddress}/ohlcv`);
 }

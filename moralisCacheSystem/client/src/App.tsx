@@ -12,11 +12,11 @@ import {
   type MoralisUsage,
   type Timeframe,
 } from './api';
+import { chainOptions, getChainLabel, getDexscreenerChainSlug } from './chains';
 import './styles.css';
 
 const DEFAULT_PAIR = '0x3eB2a8015dE1419a5089dAb37b0056F0fc24f821';
 const DEFAULT_CHAIN = 'base';
-const DEXSCREENER_URL = `https://dexscreener.com/base/${DEFAULT_PAIR}`;
 
 const timeframes: Timeframe[] = ['1min', '5min', '10min', '30min', '1h', '4h', '12h', '1d'];
 const chartRanges: ChartRange[] = ['24H', '7D', '30D', '3M', '6M', '1Y', 'ALL'];
@@ -38,6 +38,7 @@ export function App() {
 
   const lastCandle = response?.candles.at(-1);
   const previousCandle = response?.candles.at(-2);
+  const dexscreenerUrl = `https://dexscreener.com/${getDexscreenerChainSlug(chain)}/${pairAddress}`;
   const priceChange = useMemo(() => {
     if (!lastCandle || !previousCandle) {
       return 0;
@@ -124,7 +125,7 @@ export function App() {
         </div>
 
         <div className="topbar-actions">
-          <a href={DEXSCREENER_URL} target="_blank" rel="noreferrer" className="ghost-link">
+          <a href={dexscreenerUrl} target="_blank" rel="noreferrer" className="ghost-link">
             Dexscreener
           </a>
           <button className="connect-button">Connect Log In</button>
@@ -133,7 +134,7 @@ export function App() {
 
       <section className="ticker-tape" aria-label="market tape">
         {[
-          ['Base', '$2.44B'],
+          ['Market', getChainLabel(chain)],
           ['VYM', lastCandle ? `$${lastCandle.close.toFixed(8)}` : 'loading'],
           ['Source', response?.source ?? 'none'],
           ['Candles', String(response?.candles.length ?? 0)],
@@ -160,7 +161,7 @@ export function App() {
             <div className="pair-title">
               <span className="token-dot" />
               <div>
-                <strong>VYM / BASE</strong>
+                <strong>VYM / {getChainLabel(chain).toUpperCase()}</strong>
                 <small>{pairAddress.slice(0, 6)}...{pairAddress.slice(-4)}</small>
               </div>
             </div>
@@ -225,9 +226,11 @@ export function App() {
           <label className="field">
             <span>Market</span>
             <select value={chain} onChange={(event) => setChain(event.target.value)}>
-              <option value="base">Base</option>
-              <option value="eth">Ethereum</option>
-              <option value="bsc">BNB</option>
+              {chainOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
             </select>
           </label>
 
