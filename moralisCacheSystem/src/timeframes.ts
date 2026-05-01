@@ -10,6 +10,7 @@ export const supportedTimeframes = [
   '30min',
   '1h',
   '4h',
+  '6h',
   '12h',
   '1d',
   '1w',
@@ -26,6 +27,7 @@ export const timeframeSeconds: Record<OhlcvTimeframe, number> = {
   '30min': 30 * 60,
   '1h': 60 * 60,
   '4h': 4 * 60 * 60,
+  '6h': 6 * 60 * 60,
   '12h': 12 * 60 * 60,
   '1d': 24 * 60 * 60,
   '1w': 7 * 24 * 60 * 60,
@@ -42,14 +44,71 @@ export const maxSyncCandlesByTimeframe: Record<OhlcvTimeframe, number> = {
   '30min': 5000,
   '1h': 5000,
   '4h': 5000,
+  '6h': 5000,
   '12h': 5000,
   '1d': 5000,
   '1w': 2000,
   '1M': 1000,
 };
 
+const adaptiveTimeframeOrder: OhlcvTimeframe[] = [
+  '1min',
+  '5min',
+  '10min',
+  '30min',
+  '1h',
+  '4h',
+  '6h',
+  '12h',
+  '1d',
+];
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 export function isOhlcvTimeframe(value: string): value is OhlcvTimeframe {
   return supportedTimeframes.includes(value as OhlcvTimeframe);
+}
+
+export function getMinimumAdaptiveTimeframeForRange(from: Date, to: Date): OhlcvTimeframe {
+  const spanMs = Math.max(0, to.getTime() - from.getTime());
+
+  if (spanMs <= DAY_MS) {
+    return '1min';
+  }
+
+  if (spanMs <= 7 * DAY_MS) {
+    return '5min';
+  }
+
+  if (spanMs <= 30 * DAY_MS) {
+    return '30min';
+  }
+
+  if (spanMs <= 90 * DAY_MS) {
+    return '1h';
+  }
+
+  if (spanMs <= 365 * DAY_MS) {
+    return '4h';
+  }
+
+  return '12h';
+}
+
+export function getEffectiveAdaptiveTimeframe(params: {
+  requestedTimeframe: OhlcvTimeframe;
+  from: Date;
+  to: Date;
+}): OhlcvTimeframe {
+  const requestedIndex = adaptiveTimeframeOrder.indexOf(params.requestedTimeframe);
+
+  if (requestedIndex === -1) {
+    return params.requestedTimeframe;
+  }
+
+  const minimum = getMinimumAdaptiveTimeframeForRange(params.from, params.to);
+  const minimumIndex = adaptiveTimeframeOrder.indexOf(minimum);
+
+  return adaptiveTimeframeOrder[Math.max(requestedIndex, minimumIndex)] ?? params.requestedTimeframe;
 }
 
 export function estimateCandleCount(from: Date, to: Date, timeframe: OhlcvTimeframe) {

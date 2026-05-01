@@ -8,6 +8,7 @@ export type OhlcvTimeframe =
   | '30min'
   | '1h'
   | '4h'
+  | '6h'
   | '12h'
   | '1d'
   | '1w'
@@ -44,11 +45,13 @@ export type ChartCandle = {
   close: number;
   volume: number | null;
   trades: number | null;
+  source?: 'cache' | 'moralis' | 'demo' | 'filled';
 };
 
 export type ChartOhlcvResponse = {
   chain: string;
   pairAddress: string;
+  requestedTimeframe: OhlcvTimeframe;
   timeframe: OhlcvTimeframe;
   currency: OhlcvCurrency;
   from: string;

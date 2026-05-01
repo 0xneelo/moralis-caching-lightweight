@@ -177,6 +177,41 @@ Response:
 }
 ```
 
+### Moralis-Compatible OHLCV
+
+External frontends can point their Moralis-style client at this service and keep the same OHLCV request syntax. They only need to change the base URL and use one of the generated API keys:
+
+```http
+GET /api/v2.2/pairs/0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640/ohlcv?chain=eth&timeframe=1h&currency=usd&fromDate=2026-04-01T00:00:00.000Z&toDate=2026-04-28T00:00:00.000Z&limit=1000
+X-API-Key: mcs_live_generated_key
+```
+
+Solana-compatible path:
+
+```http
+GET /token/mainnet/pairs/PAIR_ADDRESS/ohlcv?timeframe=1h&currency=usd&fromDate=2026-04-01T00:00:00.000Z&toDate=2026-04-28T00:00:00.000Z&limit=1000
+X-API-Key: mcs_live_generated_key
+```
+
+Response:
+
+```json
+{
+  "cursor": null,
+  "result": [
+    {
+      "timestamp": "2026-04-01T00:00:00.000Z",
+      "open": 1.23,
+      "high": 1.3,
+      "low": 1.2,
+      "close": 1.25,
+      "volume": 12000.5,
+      "trades": 42
+    }
+  ]
+}
+```
+
 ### Queue Admin Backfill
 
 ```http
@@ -209,6 +244,38 @@ Content-Type: application/json
 {
   "enabled": false
 }
+```
+
+### Manage External API Keys
+
+Create a key:
+
+```http
+POST /api/admin/api-keys
+Authorization: Bearer change-me
+Content-Type: application/json
+```
+
+```json
+{
+  "name": "partner frontend"
+}
+```
+
+The raw `apiKey` is returned only when created. Store it securely and give that value to the external frontend as its `X-API-Key`.
+
+List keys:
+
+```http
+GET /api/admin/api-keys
+Authorization: Bearer change-me
+```
+
+Revoke a key:
+
+```http
+DELETE /api/admin/api-keys/:id
+Authorization: Bearer change-me
 ```
 
 ## Cost Controls

@@ -6,6 +6,8 @@ import { HttpError } from './httpErrors.js';
 import { registerAdminRoutes } from './routes/adminRoutes.js';
 import { registerChartRoutes } from './routes/chartRoutes.js';
 import { registerHealthRoutes } from './routes/healthRoutes.js';
+import { registerInteractionRoutes } from './routes/interactionRoutes.js';
+import { registerMoralisCompatRoutes } from './routes/moralisCompatRoutes.js';
 import { registerUsageRoutes } from './routes/usageRoutes.js';
 
 export async function buildServer() {
@@ -38,8 +40,10 @@ export async function buildServer() {
   });
 
   await registerHealthRoutes(app);
+  await registerMoralisCompatRoutes(app);
   await registerChartRoutes(app);
   await registerUsageRoutes(app);
+  await registerInteractionRoutes(app);
   await registerAdminRoutes(app);
 
   app.setErrorHandler((error, request, reply) => {

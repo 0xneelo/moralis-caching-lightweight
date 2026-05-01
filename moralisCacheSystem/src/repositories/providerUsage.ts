@@ -6,6 +6,7 @@ export const providerUsageRepository = {
   async log(params: {
     provider: string;
     endpoint: string;
+    externalApiKeyId?: string;
     chain?: string;
     pairAddress?: string;
     timeframe?: OhlcvTimeframe;
@@ -22,6 +23,7 @@ export const providerUsageRepository = {
         id,
         provider,
         endpoint,
+        external_api_key_id,
         chain,
         pair_address,
         timeframe,
@@ -31,12 +33,13 @@ export const providerUsageRepository = {
         estimated_cu,
         pages,
         duration_ms
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       `,
       [
         crypto.randomUUID(),
         params.provider,
         params.endpoint,
+        params.externalApiKeyId ?? null,
         params.chain ?? null,
         params.pairAddress ?? null,
         params.timeframe ?? null,
@@ -54,6 +57,7 @@ export const providerUsageRepository = {
     provider: string;
     from: Date;
     to: Date;
+    externalApiKeyId?: string;
   }) {
     const result = await query<{ total: string }>(
       `
@@ -62,8 +66,9 @@ export const providerUsageRepository = {
       WHERE provider = $1
         AND created_at >= $2
         AND created_at < $3
+        AND ($4::text IS NULL OR external_api_key_id = $4)
       `,
-      [params.provider, params.from, params.to]
+      [params.provider, params.from, params.to, params.externalApiKeyId ?? null]
     );
 
     return Number(result.rows[0]?.total ?? 0);

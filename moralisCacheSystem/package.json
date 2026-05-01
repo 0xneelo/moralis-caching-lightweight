@@ -18,6 +18,7 @@
     "start": "node dist/index.js",
     "start:worker": "node dist/worker.js",
     "migrate": "tsx src/scripts/migrate.ts",
+    "local:api-key": "tsx src/scripts/ensureLocalExternalApiKey.ts",
     "schedule": "tsx src/scripts/schedule.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:frontend": "tsc -p client/tsconfig.json --noEmit",

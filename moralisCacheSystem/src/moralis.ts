@@ -1,4 +1,6 @@
 import { config } from './config.js';
+import { appendInteractionTraceEvent } from './interactionLog.js';
+import { moralisLogger } from './logger.js';
 import { providerUsageRepository } from './repositories/providerUsage.js';
 import { redis } from './redis.js';
 import type { MoralisCandle, OhlcvCurrency, OhlcvTimeframe } from './types.js';
@@ -59,6 +61,7 @@ export async function fetchMoralisOhlcv(params: {
   toDate: Date;
   maxPages?: number;
   signal?: AbortSignal;
+  interactionId?: string | undefined;
 }) {
   await assertMoralisOhlcvEnabled();
 
@@ -73,6 +76,32 @@ export async function fetchMoralisOhlcv(params: {
   let cursor: string | undefined;
   let pages = 0;
   const startedAt = Date.now();
+
+  moralisLogger.warn(
+    {
+      provider: 'moralis',
+      event: 'MORALIS_OHLCV_START',
+      chain: params.chain,
+      pairAddress: params.pairAddress,
+      timeframe: params.timeframe,
+      currency: params.currency,
+      from: params.fromDate.toISOString(),
+      to: params.toDate.toISOString(),
+      maxPages,
+      estimatedMaxCu: maxPages * MORALIS_OHLC_CU_COST,
+    },
+    'MORALIS_OHLCV_START'
+  );
+  await appendInteractionTraceEvent(params.interactionId, 'moralis_start', {
+    chain: params.chain,
+    pairAddress: params.pairAddress,
+    timeframe: params.timeframe,
+    currency: params.currency,
+    from: params.fromDate.toISOString(),
+    to: params.toDate.toISOString(),
+    maxPages,
+    estimatedMaxCu: maxPages * MORALIS_OHLC_CU_COST,
+  });
 
   do {
     if (pages >= maxPages) {
@@ -110,6 +139,33 @@ export async function fetchMoralisOhlcv(params: {
     const response = await fetch(url, requestInit);
 
     if (!response.ok) {
+      moralisLogger.error(
+        {
+          provider: 'moralis',
+          event: 'MORALIS_OHLCV_PAGE_FAILED',
+          chain: params.chain,
+          pairAddress: params.pairAddress,
+          timeframe: params.timeframe,
+          currency: params.currency,
+          from: params.fromDate.toISOString(),
+          to: params.toDate.toISOString(),
+          page: pages + 1,
+          status: response.status,
+          durationMs: Date.now() - pageStartedAt,
+        },
+        'MORALIS_OHLCV_PAGE_FAILED'
+      );
+      await appendInteractionTraceEvent(params.interactionId, 'moralis_page_failed', {
+        chain: params.chain,
+        pairAddress: params.pairAddress,
+        timeframe: params.timeframe,
+        currency: params.currency,
+        from: params.fromDate.toISOString(),
+        to: params.toDate.toISOString(),
+        page: pages + 1,
+        status: response.status,
+        durationMs: Date.now() - pageStartedAt,
+      });
       throw new MoralisProviderError({
         status: response.status,
         durationMs: Date.now() - pageStartedAt,
@@ -117,10 +173,75 @@ export async function fetchMoralisOhlcv(params: {
     }
 
     const json = (await response.json()) as MoralisOhlcvResponse;
-    candles.push(...(json.result ?? []));
+    const pageCandles = json.result ?? [];
+    candles.push(...pageCandles);
     cursor = json.cursor ?? undefined;
     pages += 1;
+
+    moralisLogger.warn(
+      {
+        provider: 'moralis',
+        event: 'MORALIS_OHLCV_PAGE_OK',
+        chain: params.chain,
+        pairAddress: params.pairAddress,
+        timeframe: params.timeframe,
+        currency: params.currency,
+        from: params.fromDate.toISOString(),
+        to: params.toDate.toISOString(),
+        page: pages,
+        pageCandles: pageCandles.length,
+        hasNextCursor: Boolean(cursor),
+        estimatedCuSoFar: pages * MORALIS_OHLC_CU_COST,
+        durationMs: Date.now() - pageStartedAt,
+      },
+      'MORALIS_OHLCV_PAGE_OK'
+    );
+    await appendInteractionTraceEvent(params.interactionId, 'moralis_page_ok', {
+      chain: params.chain,
+      pairAddress: params.pairAddress,
+      timeframe: params.timeframe,
+      currency: params.currency,
+      from: params.fromDate.toISOString(),
+      to: params.toDate.toISOString(),
+      page: pages,
+      pageCandles: pageCandles.length,
+      hasNextCursor: Boolean(cursor),
+      estimatedCuSoFar: pages * MORALIS_OHLC_CU_COST,
+      durationMs: Date.now() - pageStartedAt,
+    });
   } while (cursor);
+
+  moralisLogger.warn(
+    {
+      provider: 'moralis',
+      event: 'MORALIS_OHLCV_DONE',
+      chain: params.chain,
+      pairAddress: params.pairAddress,
+      timeframe: params.timeframe,
+      currency: params.currency,
+      from: params.fromDate.toISOString(),
+      to: params.toDate.toISOString(),
+      pages,
+      candles: candles.length,
+      estimatedCu: pages * MORALIS_OHLC_CU_COST,
+      durationMs: Date.now() - startedAt,
+      truncated: Boolean(cursor),
+    },
+    'MORALIS_OHLCV_DONE'
+  );
+  await appendInteractionTraceEvent(params.interactionId, 'moralis_done', {
+    chain: params.chain,
+    pairAddress: params.pairAddress,
+    timeframe: params.timeframe,
+    currency: params.currency,
+    from: params.fromDate.toISOString(),
+    to: params.toDate.toISOString(),
+    pages,
+    candles: candles.length,
+    estimatedCu: pages * MORALIS_OHLC_CU_COST,
+    durationMs: Date.now() - startedAt,
+    truncated: Boolean(cursor),
+  });
 
   return {
     candles,

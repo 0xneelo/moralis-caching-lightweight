@@ -2,6 +2,7 @@ import { Worker } from 'bullmq';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { fetchMoralisOhlcv } from '../moralis.js';
+import { normalizePairAddress } from '../pairAddress.js';
 import { backfillJobRepository } from '../repositories/backfillJobs.js';
 import { candleRepository } from '../repositories/candles.js';
 import { providerUsageRepository } from '../repositories/providerUsage.js';
@@ -15,6 +16,7 @@ export function createBackfillWorker() {
     async (job) => {
       const payload = job.data;
       const dbJobId = payload.dbJobId;
+      const pairAddress = normalizePairAddress(payload.chain, payload.pairAddress);
 
       if (dbJobId) {
         await backfillJobRepository.markStarted(dbJobId);
@@ -23,7 +25,7 @@ export function createBackfillWorker() {
       try {
         const result = await fetchMoralisOhlcv({
           chain: payload.chain,
-          pairAddress: payload.pairAddress.toLowerCase(),
+          pairAddress,
           timeframe: payload.timeframe,
           currency: payload.currency,
           fromDate: new Date(payload.from),
@@ -33,7 +35,7 @@ export function createBackfillWorker() {
 
         const upsertResult = await candleRepository.upsertCandles({
           chain: payload.chain,
-          pairAddress: payload.pairAddress.toLowerCase(),
+          pairAddress,
           timeframe: payload.timeframe,
           currency: payload.currency,
           candles: result.candles,
@@ -43,7 +45,7 @@ export function createBackfillWorker() {
           provider: 'moralis',
           endpoint: 'getPairCandlesticks',
           chain: payload.chain,
-          pairAddress: payload.pairAddress.toLowerCase(),
+          pairAddress,
           timeframe: payload.timeframe,
           requestFrom: new Date(payload.from),
           requestTo: new Date(payload.to),

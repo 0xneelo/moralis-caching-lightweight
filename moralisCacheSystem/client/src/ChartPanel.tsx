@@ -4,22 +4,40 @@ import {
   HistogramSeries,
   createChart,
   type IChartApi,
+  type IRange,
   type ISeriesApi,
   type UTCTimestamp,
 } from 'lightweight-charts';
-import type { ChartCandle } from './api';
+import type { ChartCandle, Timeframe, TimeWindow } from './api';
 
 type ChartPanelProps = {
   candles: ChartCandle[];
   error: string | null;
+  timeframe: Timeframe;
+  debugColors: boolean;
+  visibleRange: TimeWindow;
+  visibleRangeRevision: number;
+  onVisibleRangeChange: (range: TimeWindow) => void;
 };
 
-export function ChartPanel({ candles, error }: ChartPanelProps) {
+export function ChartPanel({
+  candles,
+  error,
+  timeframe,
+  debugColors,
+  visibleRange,
+  visibleRangeRevision,
+  onVisibleRangeChange,
+}: ChartPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
-  const priceRangeRef = useRef<{ minValue: number; maxValue: number } | null>(null);
+  const onVisibleRangeChangeRef = useRef(onVisibleRangeChange);
+  const visibleRangeRef = useRef(visibleRange);
+  const candlesRef = useRef(candles);
+  const timeframeRef = useRef(timeframe);
+  const suppressVisibleRangeEventRef = useRef(false);
 
   const chartData = useMemo(
     () =>
@@ -29,8 +47,9 @@ export function ChartPanel({ candles, error }: ChartPanelProps) {
         high: candle.high,
         low: candle.low,
         close: candle.close,
+        ...getCandleColors(candle, debugColors),
       })),
-    [candles]
+    [candles, debugColors]
   );
 
   const volumeData = useMemo(
@@ -38,10 +57,26 @@ export function ChartPanel({ candles, error }: ChartPanelProps) {
       candles.map((candle) => ({
         time: candle.time as UTCTimestamp,
         value: candle.volume ?? 0,
-        color: candle.close >= candle.open ? 'rgba(70, 178, 151, 0.42)' : 'rgba(220, 91, 127, 0.42)',
+        color: getVolumeColor(candle, debugColors),
       })),
-    [candles]
+    [candles, debugColors]
   );
+
+  useEffect(() => {
+    onVisibleRangeChangeRef.current = onVisibleRangeChange;
+  }, [onVisibleRangeChange]);
+
+  useEffect(() => {
+    visibleRangeRef.current = visibleRange;
+  }, [visibleRange]);
+
+  useEffect(() => {
+    candlesRef.current = candles;
+  }, [candles]);
+
+  useEffect(() => {
+    timeframeRef.current = timeframe;
+  }, [timeframe]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -81,16 +116,6 @@ export function ChartPanel({ candles, error }: ChartPanelProps) {
       wickDownColor: '#f0759a',
       borderVisible: false,
       priceFormat: getPriceFormat(candles),
-      autoscaleInfoProvider: () =>
-        priceRangeRef.current
-          ? {
-              priceRange: priceRangeRef.current,
-              margins: {
-                above: 28,
-                below: 28,
-              },
-            }
-          : null,
     });
 
     const volumeSeries = chart.addSeries(HistogramSeries, {
@@ -110,7 +135,26 @@ export function ChartPanel({ candles, error }: ChartPanelProps) {
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
 
+    const handleVisibleRangeChange = (range: IRange<number> | null) => {
+      if (!range || suppressVisibleRangeEventRef.current) {
+        return;
+      }
+
+      const inferredRange = inferVisibleTimeRangeFromLogicalRange({
+        logicalRange: range,
+        candles: candlesRef.current,
+        timeframe: timeframeRef.current,
+      });
+
+      if (inferredRange) {
+        onVisibleRangeChangeRef.current(inferredRange);
+      }
+    };
+
+    chart.timeScale().subscribeVisibleLogicalRangeChange(handleVisibleRangeChange);
+
     return () => {
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(handleVisibleRangeChange);
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
@@ -119,9 +163,7 @@ export function ChartPanel({ candles, error }: ChartPanelProps) {
   }, []);
 
   useEffect(() => {
-    const priceRange = getPriceRange(candles);
-    priceRangeRef.current = priceRange;
-
+    suppressVisibleRangeEventRef.current = true;
     candleSeriesRef.current?.applyOptions({
       priceFormat: getPriceFormat(candles),
     });
@@ -130,9 +172,28 @@ export function ChartPanel({ candles, error }: ChartPanelProps) {
 
     if (chartData.length > 0) {
       candleSeriesRef.current?.priceScale().setAutoScale(true);
-      chartRef.current?.timeScale().fitContent();
     }
+
+    window.setTimeout(() => {
+      suppressVisibleRangeEventRef.current = false;
+    }, 500);
   }, [candles, chartData, volumeData]);
+
+  useEffect(() => {
+    if (chartData.length === 0) {
+      return;
+    }
+
+    suppressVisibleRangeEventRef.current = true;
+    const range = visibleRangeRef.current;
+    chartRef.current?.timeScale().setVisibleRange({
+      from: Math.floor(range.from.getTime() / 1000) as UTCTimestamp,
+      to: Math.floor(range.to.getTime() / 1000) as UTCTimestamp,
+    });
+    window.setTimeout(() => {
+      suppressVisibleRangeEventRef.current = false;
+    }, 500);
+  }, [chartData.length, visibleRangeRevision]);
 
   return (
     <div className="chart-shell">
@@ -152,31 +213,118 @@ export function ChartPanel({ candles, error }: ChartPanelProps) {
   );
 }
 
-function getPriceRange(candles: ChartCandle[]) {
-  const lows = candles.map((candle) => candle.low).filter(Number.isFinite);
-  const highs = candles.map((candle) => candle.high).filter(Number.isFinite);
+function inferVisibleTimeRangeFromLogicalRange(params: {
+  logicalRange: IRange<number>;
+  candles: ChartCandle[];
+  timeframe: Timeframe;
+}): TimeWindow | null {
+  const firstCandle = params.candles[0];
 
-  if (lows.length === 0 || highs.length === 0) {
+  if (!firstCandle) {
     return null;
   }
 
-  const low = Math.min(...lows);
-  const high = Math.max(...highs);
+  const stepMs = timeframeToSeconds(params.timeframe) * 1000;
+  const firstTimeMs = firstCandle.time * 1000;
+  const from = new Date(firstTimeMs + Math.floor(params.logicalRange.from) * stepMs);
+  const to = new Date(firstTimeMs + Math.ceil(params.logicalRange.to + 1) * stepMs);
 
-  if (low === high) {
-    const pad = Math.max(Math.abs(low) * 0.02, getMinMoveForPrice(low) * 20);
+  if (to <= from) {
+    return null;
+  }
+
+  return { from, to };
+}
+
+function timeframeToSeconds(timeframe: Timeframe) {
+  switch (timeframe) {
+    case '1min':
+      return 60;
+    case '5min':
+      return 5 * 60;
+    case '10min':
+      return 10 * 60;
+    case '30min':
+      return 30 * 60;
+    case '1h':
+      return 60 * 60;
+    case '4h':
+      return 4 * 60 * 60;
+    case '6h':
+      return 6 * 60 * 60;
+    case '12h':
+      return 12 * 60 * 60;
+    case '1d':
+      return 24 * 60 * 60;
+    case '1w':
+      return 7 * 24 * 60 * 60;
+    case '1M':
+      return 30 * 24 * 60 * 60;
+  }
+}
+
+function getCandleColors(candle: ChartCandle, debugColors: boolean) {
+  const bullish = candle.close >= candle.open;
+
+  if (!debugColors) {
+    const color = bullish ? '#46b297' : '#dc5b7f';
     return {
-      minValue: low - pad,
-      maxValue: high + pad,
+      color,
+      wickColor: color,
     };
   }
 
-  const pad = (high - low) * 0.08;
+  if (candle.source === 'cache') {
+    const color = bullish ? '#3b82f6' : '#f59e0b';
+    return {
+      color,
+      wickColor: color,
+    };
+  }
 
+  if (candle.source === 'demo') {
+    const color = bullish ? '#8b5cf6' : '#f97316';
+    return {
+      color,
+      wickColor: color,
+    };
+  }
+
+  if (candle.source === 'filled') {
+    const color = '#64748b';
+    return {
+      color,
+      wickColor: color,
+    };
+  }
+
+  const color = bullish ? '#46b297' : '#dc5b7f';
   return {
-    minValue: Math.max(0, low - pad),
-    maxValue: high + pad,
+    color,
+    wickColor: color,
   };
+}
+
+function getVolumeColor(candle: ChartCandle, debugColors: boolean) {
+  const bullish = candle.close >= candle.open;
+
+  if (!debugColors) {
+    return bullish ? 'rgba(70, 178, 151, 0.42)' : 'rgba(220, 91, 127, 0.42)';
+  }
+
+  if (candle.source === 'cache') {
+    return bullish ? 'rgba(59, 130, 246, 0.42)' : 'rgba(245, 158, 11, 0.42)';
+  }
+
+  if (candle.source === 'demo') {
+    return bullish ? 'rgba(139, 92, 246, 0.42)' : 'rgba(249, 115, 22, 0.42)';
+  }
+
+  if (candle.source === 'filled') {
+    return 'rgba(100, 116, 139, 0.18)';
+  }
+
+  return bullish ? 'rgba(70, 178, 151, 0.42)' : 'rgba(220, 91, 127, 0.42)';
 }
 
 function getPriceFormat(candles: ChartCandle[]) {
@@ -199,8 +347,4 @@ function getPrecisionForPrice(price: number) {
   if (price < 1) return 6;
   if (price < 100) return 4;
   return 2;
-}
-
-function getMinMoveForPrice(price: number) {
-  return 10 ** -getPrecisionForPrice(Math.abs(price));
 }

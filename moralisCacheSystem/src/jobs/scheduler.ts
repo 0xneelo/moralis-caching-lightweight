@@ -1,4 +1,5 @@
 import { enqueueBackfillJob } from './enqueue.js';
+import { normalizePairAddress } from '../pairAddress.js';
 import { pairRepository } from '../repositories/pairs.js';
 
 export async function enqueueActivePairRefresh() {
@@ -12,7 +13,7 @@ export async function enqueueActivePairRefresh() {
     jobs.push(
       await enqueueBackfillJob({
         chain: pair.chain,
-        pairAddress: pair.pairAddress.toLowerCase(),
+        pairAddress: normalizePairAddress(pair.chain, pair.pairAddress),
         timeframe: '1min',
         currency: 'usd',
         from: from.toISOString(),

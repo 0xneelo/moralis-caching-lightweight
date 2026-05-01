@@ -119,6 +119,7 @@ button {
 
 .ghost-link,
 .connect-button,
+.mode-toggle,
 .timeframe-row button,
 .tool-rail button,
 .side-toggle button,
@@ -132,11 +133,18 @@ button {
 }
 
 .ghost-link,
-.connect-button {
+.connect-button,
+.mode-toggle {
   padding: 8px 12px;
   border-radius: 999px;
   font-size: 12px;
   font-weight: 700;
+}
+
+.mode-toggle.active {
+  color: oklch(12% 0.035 270);
+  background: var(--warning);
+  border-color: oklch(88% 0.14 82 / 55%);
 }
 
 .connect-button {
@@ -278,6 +286,12 @@ button {
   color: oklch(96% 0.03 270);
   background: oklch(45% 0.18 262);
   border-color: oklch(75% 0.12 262 / 45%);
+}
+
+.timeframe-row button.effective {
+  color: oklch(12% 0.035 270);
+  background: var(--warning);
+  border-color: oklch(88% 0.14 82 / 55%);
 }
 
 .timeframe-row button.range-active {

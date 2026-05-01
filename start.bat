@@ -30,6 +30,13 @@ if not exist "node_modules" (
   )
 )
 
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$envPath = Join-Path (Get-Location) '.env'; $adminLine = 'ADMIN_API_KEY=local-admin-key'; if (-not (Test-Path $envPath)) { Set-Content -Path $envPath -Value $adminLine -Encoding utf8; Write-Host 'Created .env with a local ADMIN_API_KEY.' } else { $content = Get-Content -Path $envPath -Raw; if ($content -notmatch '(?m)^\s*ADMIN_API_KEY\s*=') { Add-Content -Path $envPath -Value ''; Add-Content -Path $envPath -Value $adminLine; Write-Host 'Added local ADMIN_API_KEY to .env.' } }"
+if errorlevel 1 (
+  echo Failed to prepare local ADMIN_API_KEY.
+  pause
+  exit /b 1
+)
+
 where docker >nul 2>nul
 if errorlevel 1 (
   echo Docker was not found. Starting no-Docker local memory mode.
@@ -62,7 +69,16 @@ if errorlevel 1 (
   exit /b %errorlevel%
 )
 
+echo Preparing local Moralis-compatible X-API-Key...
+call npm run local:api-key
+if errorlevel 1 (
+  echo Failed to prepare local Moralis-compatible API key.
+  pause
+  exit /b %errorlevel%
+)
+
 echo Starting API, worker, and frontend...
+echo Admin API key for local admin routes: local-admin-key
 echo.
 call npm run dev:all
 pause

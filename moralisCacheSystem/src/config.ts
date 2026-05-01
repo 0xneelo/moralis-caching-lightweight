@@ -10,6 +10,9 @@ const configSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3001),
   LOG_LEVEL: z.string().default('info'),
   LOG_FILE: z.string().default('logs/app.log'),
+  MORALIS_LOG_FILE: z.string().default('logs/moralis.log'),
+  INTERACTION_LOG_FILE: z.string().default('logs/interactions.log'),
+  INTERACTION_LOG_DIR: z.string().default('logs/interactions'),
   MORALIS_API_KEY: z.string().default(''),
   MORALIS_DAILY_CU_BUDGET: z.coerce.number().int().positive().default(5_000_000),
   DATABASE_URL: z.string().url().default('postgres://postgres:postgres@localhost:5432/moralis_cache'),
@@ -17,7 +20,11 @@ const configSchema = z.object({
   CHART_PROVIDER_ENABLED: z.coerce.boolean().default(true),
   MAX_SYNC_MORALIS_PAGES: z.coerce.number().int().positive().default(3),
   MAX_SYNC_GAP_CANDLES: z.coerce.number().int().positive().default(3000),
+  EXTERNAL_API_KEY_REQUEST_RATE_LIMIT: z.coerce.number().int().positive().default(600),
+  EXTERNAL_API_KEY_CACHE_MISS_RATE_LIMIT: z.coerce.number().int().positive().default(20),
+  EXTERNAL_API_KEY_DAILY_CU_BUDGET: z.coerce.number().int().positive().default(100_000),
   DEFAULT_CURRENCY: z.enum(['usd', 'native']).default('usd'),
+  TUNNEL_MODE: z.coerce.boolean().default(false),
   ADMIN_API_KEY: z.string().optional(),
 });
 

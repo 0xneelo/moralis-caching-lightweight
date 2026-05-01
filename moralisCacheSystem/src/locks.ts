@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { normalizePairAddress } from './pairAddress.js';
 import { redis } from './redis.js';
 
 export async function withRedisLock<T>(
@@ -35,7 +36,7 @@ export function buildGapFetchLockKey(params: {
     'lock',
     'ohlcv',
     params.chain,
-    params.pairAddress.toLowerCase(),
+    normalizePairAddress(params.chain, params.pairAddress),
     params.timeframe,
     params.currency,
     params.from.toISOString(),

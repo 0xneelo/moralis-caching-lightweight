@@ -1,0 +1,2491 @@
+# Chart Implementation Documentation
+
+This document describes the chart implementation in this repository in enough detail to rebuild a cleanroom fork that behaves like the current project. It covers the frontend chart UI, client API layer, backend routes, cache and database design, Moralis provider integration, adaptive timeframe logic, background workers, rate limits, telemetry, local development mode, tests, and operational scripts.
+
+The current chart implementation lives mostly under `moralisCacheSystem/`. The production-style stack is a React/Vite client backed by a Fastify API, Redis, Postgres, BullMQ workers, and Moralis OHLCV data. There is also a local memory-only API mode for development fallback.
+
+## 1. High-Level Architecture
+
+The chart system has four major layers:
+
+1. Frontend terminal UI
+   - React application rendered by Vite.
+   - Provides the chart shell, pair/chain inputs, range buttons, timeframe buttons, usage display, trade-ticket mock UI, and interaction logging.
+   - Uses TradingView Lightweight Charts for candlesticks and volume.
+
+2. Client API and window math
+   - Converts UI state into `/api/charts/ohlcv` requests.
+   - Calculates visible windows, prefetch windows, adaptive effective timeframes, and request chunking.
+   - Fetches Moralis usage and browser-direct Dexscreener metadata.
+
+3. Backend chart API
+   - Fastify route `GET /api/charts/ohlcv` validates requests and delegates to the chart service.
+   - Chart service checks Redis response cache, queries Postgres candles, detects gaps, optionally fetches Moralis, writes candles, fills missing bars, and returns a dense response.
+   - Compatibility routes expose Moralis-shaped OHLCV endpoints protected by external API keys.
+
+4. Persistence, jobs, and controls
+   - Postgres stores candles, tracked pairs, backfill jobs, external API keys, and provider usage.
+   - Redis stores response cache, locks, rate-limit counters, feature flags, and BullMQ queue data.
+   - Workers fill large historical gaps asynchronously.
+   - Admin routes can enqueue backfills, toggle Moralis, and manage external API keys.
+
+Core implementation files:
+
+| Area | Path |
+| --- | --- |
+| React shell | `moralisCacheSystem/client/src/App.tsx` |
+| Chart rendering | `moralisCacheSystem/client/src/ChartPanel.tsx` |
+| Client API/types/window helpers | `moralisCacheSystem/client/src/api.ts` |
+| Client chain metadata | `moralisCacheSystem/client/src/chains.ts` |
+| Client styles | `moralisCacheSystem/client/src/styles.css` |
+| Vite proxy | `moralisCacheSystem/client/vite.config.ts` |
+| Server bootstrap | `moralisCacheSystem/src/server.ts` |
+| API entrypoint | `moralisCacheSystem/src/index.ts` |
+| Chart route | `moralisCacheSystem/src/routes/chartRoutes.ts` |
+| Chart service | `moralisCacheSystem/src/services/chartService.ts` |
+| Moralis client | `moralisCacheSystem/src/moralis.ts` |
+| Timeframes | `moralisCacheSystem/src/timeframes.ts` |
+| Types | `moralisCacheSystem/src/types.ts` |
+| Redis cache helpers | `moralisCacheSystem/src/cache.ts` |
+| Gap detection | `moralisCacheSystem/src/gaps.ts` |
+| Rate limits | `moralisCacheSystem/src/rateLimit.ts` |
+| Redis locks | `moralisCacheSystem/src/locks.ts` |
+| Pair normalization | `moralisCacheSystem/src/pairAddress.ts` |
+| Local memory server | `moralisCacheSystem/src/localIndex.ts` |
+| Migrations | `moralisCacheSystem/migrations/*.sql` |
+| Backfill jobs | `moralisCacheSystem/src/jobs/*` |
+| Repositories | `moralisCacheSystem/src/repositories/*` |
+
+## 2. Frontend Application
+
+### 2.1 Runtime and Bootstrapping
+
+The frontend is a Vite React app. The root package runs Vite with `client/vite.config.ts`; there is no separate `client/package.json` in the current structure.
+
+Frontend entry:
+
+- `moralisCacheSystem/client/src/main.tsx`
+- Renders `<App />` inside React `StrictMode`.
+- Uses the DOM element with id `root`.
+
+Vite dev server:
+
+- Runs on port `5173`.
+- Proxies `/api` to `http://localhost:3001`.
+- Proxies `/health` to `http://localhost:3001`.
+
+Important dependency note:
+
+- `ChartPanel.tsx` imports `lightweight-charts`.
+- If creating a clean fork, declare `lightweight-charts` explicitly in the fork package manifest along with React, Vite, TypeScript, and related tooling.
+
+### 2.2 App Component Responsibilities
+
+`moralisCacheSystem/client/src/App.tsx` is the main chart application shell. It owns user state, fetch orchestration, visible-window state, pair metadata, Moralis usage polling, chart controls, and interaction logging.
+
+It renders a desktop-first trading terminal layout:
+
+- Header bar with token/pair context, network selector, pair address input, and status widgets.
+- Ticker strip with pair metadata and source/cache/provider state.
+- Workspace grid with:
+  - Left tool rail of visual-only tool buttons.
+  - Central chart area.
+  - Right trade-ticket panel.
+- Chart top bar with range presets and timeframe presets.
+- Chart footer with loading, error, cache, and data source status.
+
+The trade-ticket panel is mostly visual/mock behavior. It tracks buy/sell side, amount, and slippage, but the execute/connect controls are not wired to actual trading.
+
+### 2.3 Frontend State
+
+Main React state in `App.tsx`:
+
+| State | Purpose |
+| --- | --- |
+| `pairAddress` | Current DEX pair address. Defaults to a Base pair. |
+| `chain` | Current chain id string. Defaults to `base`. |
+| `timeframe` | Requested chart timeframe selected by the user. Defaults to `1h`. |
+| `chartRange` | Selected visible range preset. Defaults to `30D`. |
+| `side` | Mock trade side, `buy` or `sell`. |
+| `amount` | Mock trade amount text. |
+| `slippage` | Mock trade slippage number. |
+| `response` | Last successful chart response, or null before load. |
+| `usage` | Moralis usage summary, or null on failure/loading. |
+| `pairMetadata` | Dexscreener pair metadata, or null on failure/loading. |
+| `error` | Chart fetch error string, or null. |
+| `loading` | Whether a chart fetch is in progress. |
+| `debugColors` | Whether candles/volume use source-aware debug colors. Defaults to true. |
+| `visibleRange` | Current requested visible time window as `{ from: Date, to: Date }`. |
+| `visibleRangeRevision` | Counter used to force the chart to snap to a preset range. |
+| `activeInteractionId` | Optional id used to correlate frontend actions with backend trace events. |
+
+Important refs:
+
+| Ref | Purpose |
+| --- | --- |
+| `zoomDebounceRef` | Debounces chart pan/zoom driven backend updates. |
+| `ignoreChartRangeUntilRef` | Temporarily ignores chart range events after preset/timeframe clicks. |
+
+Derived values:
+
+| Derived value | Purpose |
+| --- | --- |
+| `effectiveTimeframe` | The actual timeframe used for the current visible range. It may be coarser than the user-selected timeframe. |
+| `loadRange` | Prefetch range sent to the backend. It extends the visible range to reduce immediate refetches while panning/zooming. |
+| `chainSlug` | Dexscreener chain slug derived from the app chain id. |
+
+### 2.4 User Interactions
+
+#### Range Preset Buttons
+
+Range presets include short intraday ranges and longer historical windows. The UI includes:
+
+- `1H`
+- `4H`
+- `12H`
+- `24H`
+- `7D`
+- `30D`
+- `2M`
+- `6M`
+- `1Y`
+- `ALL`
+
+When the user selects a chart range:
+
+1. Any pending zoom debounce is cleared.
+2. A short ignore window is set so chart range events caused by programmatic snapping do not fight with the user click.
+3. A new interaction id is created.
+4. A debug interaction is posted to `/api/debug/interactions`.
+5. `chartRange` is updated.
+6. `visibleRange` is replaced with the preset window.
+7. `visibleRangeRevision` increments so `ChartPanel` calls `timeScale().setVisibleRange(...)`.
+
+The ignore period is about 1.5 seconds. This avoids a loop where setting the visible range causes Lightweight Charts to emit range events that immediately overwrite the intended preset.
+
+#### Timeframe Buttons
+
+Timeframe buttons shown in the UI:
+
+- `1min`
+- `5min`
+- `10min`
+- `30min`
+- `1h`
+- `4h`
+- `12h`
+- `1d`
+
+When the user selects a timeframe:
+
+1. The app creates and logs an interaction id.
+2. `timeframe` is updated to the requested timeframe.
+3. A preferred chart range is selected for that timeframe.
+4. `visibleRange` is replaced with the preferred range window.
+5. `visibleRangeRevision` increments.
+
+Preferred ranges:
+
+| Requested timeframe | Preferred range |
+| --- | --- |
+| `1min` | `1H` |
+| `5min` | `4H` |
+| `10min` | `12H` |
+| `30min` | `24H` |
+| `1h` | `30D` |
+| `4h` | `2M` |
+| `12h` | `6M` |
+| `1d` | `1Y` |
+
+The app can show an "effective" styling state on timeframe buttons when the backend/client effective timeframe differs from the requested timeframe. Example: a user requests `1min` over a very wide range, but the chart uses a coarser effective timeframe.
+
+#### Chart Pan and Zoom
+
+`ChartPanel` notifies `App` about visible range changes caused by user pan/zoom.
+
+`App` handles those updates with these rules:
+
+- Debounce chart zoom/range events by about 500ms.
+- Ignore chart range events for about 1.5s after a preset or timeframe click.
+- Only expand the tracked `visibleRange` when the inferred visible span grows materially.
+- Avoid narrowing the load window just because a redraw or programmatic range set produced a smaller logical range.
+
+The expansion threshold is roughly 10%. This behavior is important for caching: once a wider range has been loaded, local panning inside that wider range should not constantly shrink and refetch the backend window.
+
+#### Pair and Chain Inputs
+
+Changing the pair address or chain triggers:
+
+- Chart refetch after debounce.
+- Dexscreener metadata refetch.
+- New backend `pairRepository.touchPair(...)` on chart request.
+
+The pair address is treated as a DEX pair address, not a token address.
+
+#### Debug Colors Toggle
+
+The UI includes a debug colors toggle. When enabled, chart candles and volume bars are colored by data source:
+
+- Cache candles can use blue/amber tinting.
+- Demo candles can use purple/orange tinting.
+- Filled synthetic candles use a muted/slate style.
+- Moralis/default real candles use normal green/red up/down colors.
+
+This is useful for visually distinguishing real provider data, cached data, demo data, and filled bars.
+
+#### Dexscreener Link
+
+The app builds a Dexscreener URL:
+
+`https://dexscreener.com/{chainSlug}/{pairAddress}`
+
+The slug comes from `chains.ts`. Some app chain ids map to different Dexscreener slugs.
+
+### 2.5 Frontend Data Fetching
+
+The chart fetch effect is debounced by about 600ms. It uses an `AbortController` so stale requests are cancelled when dependencies change.
+
+Dependencies that can trigger chart reload:
+
+- `chain`
+- `pairAddress`
+- `timeframe`
+- `loadRange`
+- `activeInteractionId`
+
+The request uses:
+
+- Requested timeframe: the selected UI timeframe.
+- Effective timeframe: calculated from requested timeframe and visible window.
+- Load window: a prefetch window that can be wider than the visible window.
+- Visible window: passed separately as `visibleFrom` and `visibleTo` so the backend can choose adaptive granularity based on what the user is looking at.
+
+On success:
+
+- `response` is updated.
+- `error` is cleared.
+- `loading` is false.
+
+On failure:
+
+- `error` is set from the backend JSON `{ error }` when present, otherwise from HTTP status text or thrown error.
+- `loading` is false.
+- The previous successful `response` is not cleared. This means stale candles can remain visible under an error overlay/footer.
+
+Abort errors are ignored.
+
+### 2.6 Moralis Usage Polling
+
+The frontend polls:
+
+`GET /api/usage/moralis`
+
+Polling cadence:
+
+- About every 5 seconds.
+- The effect restarts when the chart response changes.
+
+Failure behavior:
+
+- Usage is set to null.
+- Errors are not shown as blocking chart errors.
+
+The usage display is informational and does not drive frontend rate limiting.
+
+### 2.7 Dexscreener Metadata
+
+The frontend fetches pair metadata directly from Dexscreener:
+
+`https://api.dexscreener.com/latest/dex/pairs/{chainSlug}/{pairAddress}`
+
+Returned data is normalized into a lightweight UI metadata object:
+
+- base token symbol
+- quote token symbol
+- pair label
+- price USD
+- liquidity USD
+- 24h volume
+- 24h price change
+- Dexscreener URL
+
+Failure behavior:
+
+- Metadata becomes null.
+- The UI falls back to loading/placeholder labels.
+- Chart loading does not fail because metadata failed.
+
+Because this call is browser-direct, CORS or Dexscreener availability can affect metadata independently of the backend chart.
+
+## 3. Chart Rendering
+
+### 3.1 ChartPanel Component
+
+`moralisCacheSystem/client/src/ChartPanel.tsx` owns the Lightweight Charts instance.
+
+Responsibilities:
+
+- Create and destroy the chart.
+- Add candlestick and volume series.
+- Convert backend candles into Lightweight Charts data points.
+- Apply per-candle colors.
+- Keep price formatting adaptive to token price scale.
+- Set visible ranges when the parent selects a preset.
+- Infer user-visible time windows from chart logical range events.
+- Render empty and error overlays.
+
+The chart is created once in a mount effect and removed on unmount.
+
+React StrictMode in development can mount/unmount twice. This is expected.
+
+### 3.2 Chart Library
+
+The implementation uses TradingView Lightweight Charts:
+
+- `createChart`
+- `CandlestickSeries`
+- `HistogramSeries`
+- `UTCTimestamp`
+
+Data timestamps are Unix seconds. The backend `ChartCandle.time` field must remain Unix seconds for 1:1 behavior.
+
+### 3.3 Chart Options
+
+Current chart style:
+
+- Transparent chart background.
+- Dark theme.
+- Subtle grid lines.
+- Crosshair with a muted green/tint.
+- Font family matching the UI mono font.
+- `autoSize: true`.
+- `timeScale.secondsVisible: false`.
+
+The chart container is expected to size itself through CSS; the chart uses automatic sizing.
+
+### 3.4 Candlestick Series
+
+Each candle maps from backend shape:
+
+| Backend field | Chart field |
+| --- | --- |
+| `time` | `time` as `UTCTimestamp` |
+| `open` | `open` |
+| `high` | `high` |
+| `low` | `low` |
+| `close` | `close` |
+
+Per-bar color is determined from:
+
+- Whether the candle is up or down (`close >= open`).
+- Candle `source`.
+- `debugColors` flag.
+
+The default bullish/bearish palette is green/red. Border visibility is disabled, while wick colors follow the same source/up-down logic.
+
+### 3.5 Volume Histogram
+
+Volume is rendered as a histogram series.
+
+Volume behavior:
+
+- Uses `volume ?? 0`.
+- Uses a separate scale with `priceScaleId: ''`.
+- The volume scale margins place volume in the lower band of the chart.
+- Price format type is `volume`.
+- Per-bar color follows source/up-down logic, usually with opacity.
+
+### 3.6 Dynamic Price Precision
+
+The chart chooses price precision from the magnitude of visible candle prices. Low-priced pairs need more decimals than high-priced pairs.
+
+Conceptual behavior:
+
+| Price magnitude | Needed precision |
+| --- | --- |
+| Very small prices | More decimals |
+| Normal token prices | Moderate decimals |
+| High prices | Fewer decimals |
+
+The price format includes:
+
+- `type: 'price'`
+- `precision`
+- `minMove`
+
+This is necessary for low-priced DEX pairs where two or four decimals would be unusable.
+
+### 3.7 Visible Range Synchronization
+
+Parent-to-chart:
+
+- `App` passes `visibleRange` and `visibleRangeRevision`.
+- When `visibleRangeRevision` changes, `ChartPanel` calls `chart.timeScale().setVisibleRange({ from, to })`.
+- `from` and `to` are Unix seconds.
+
+Chart-to-parent:
+
+- `ChartPanel` subscribes to `subscribeVisibleLogicalRangeChange`.
+- It converts the logical range back into an approximate time range.
+- It calls `onVisibleRangeChange` with `{ from: Date, to: Date }`.
+
+Suppression:
+
+- After programmatic range changes, `ChartPanel` suppresses visible-range events for about 500ms.
+- After setting data, it also suppresses events briefly.
+
+This prevents feedback loops between `App` and Lightweight Charts.
+
+### 3.8 Logical Range Inference
+
+Lightweight Charts exposes logical indexes, not always direct time bounds. The implementation estimates visible times by assuming:
+
+- The first chart candle has a known Unix timestamp.
+- Candles are uniformly spaced by the current timeframe.
+- Logical index `0` maps to the first candle.
+
+This works well when the chart response is dense. The backend intentionally fills missing candles so the series remains dense and this inference remains stable.
+
+If a fork stops filling missing candles, pan/zoom inference may become less accurate.
+
+### 3.9 Empty and Error States
+
+The chart area can show overlay messages:
+
+- Empty state when there are no candles.
+- Error state when the latest request failed.
+
+The previous candle series can remain visible under an error because `App` does not clear the last successful response on failure.
+
+The empty overlay has pointer events disabled so it does not block chart interaction.
+
+## 4. Client API Layer
+
+### 4.1 Types
+
+The main client-side types are in `moralisCacheSystem/client/src/api.ts`.
+
+Important frontend contract types:
+
+| Type | Purpose |
+| --- | --- |
+| `Timeframe` | Supported chart resolution string. |
+| `ChartRange` | UI range preset string. |
+| `TimeWindow` | `{ from: Date, to: Date }`. |
+| `ChartCandle` | One OHLCV candle returned by backend. |
+| `ChartResponse` | Backend chart response. |
+| `ChartRequest` | Client request options for chart fetch. |
+| `MoralisUsage` | Usage summary shape shown in UI. |
+| `PairMetadata` | Normalized Dexscreener metadata. |
+
+### 4.2 Chart Response Shape Expected by Frontend
+
+The frontend expects:
+
+```json
+{
+  "chain": "base",
+  "pairAddress": "0x...",
+  "requestedTimeframe": "1min",
+  "timeframe": "1h",
+  "currency": "usd",
+  "from": "2026-05-01T00:00:00.000Z",
+  "to": "2026-05-01T01:00:00.000Z",
+  "source": "cache",
+  "partial": false,
+  "candles": [
+    {
+      "time": 1777593600,
+      "timestamp": "2026-05-01T00:00:00.000Z",
+      "open": 1.0,
+      "high": 1.1,
+      "low": 0.9,
+      "close": 1.05,
+      "volume": 12345,
+      "trades": 10,
+      "source": "cache"
+    }
+  ]
+}
+```
+
+Important invariants:
+
+- `time` is Unix seconds.
+- `timestamp` is ISO 8601.
+- OHLC values are numbers.
+- `volume` and `trades` may be null.
+- `source` can be used for UI coloring.
+- `partial` means some requested candles may be filled or cache-only because provider fetching was limited, locked, truncated, or deferred.
+
+### 4.3 Chart Fetch Request
+
+The client calls:
+
+`GET /api/charts/ohlcv`
+
+Query parameters:
+
+| Parameter | Meaning |
+| --- | --- |
+| `chain` | Chain id, for example `base`, `eth`, `solana`. |
+| `pairAddress` | DEX pair address. |
+| `timeframe` | Effective timeframe to load. |
+| `requestedTimeframe` | User-selected timeframe before adaptive coarsening. |
+| `currency` | `usd` by default. |
+| `from` | Load range start ISO timestamp. |
+| `to` | Load range end ISO timestamp. |
+| `visibleFrom` | User-visible range start ISO timestamp. |
+| `visibleTo` | User-visible range end ISO timestamp. |
+
+Optional header:
+
+| Header | Purpose |
+| --- | --- |
+| `x-interaction-id` | Correlates request with frontend interaction traces. |
+
+### 4.4 Request Chunking
+
+The client can split a chart request into sequential chunks when the requested window is too large for a single request at the selected timeframe.
+
+Chunking uses:
+
+- Timeframe seconds.
+- A maximum candle count per request for each timeframe.
+- Sequential `await` requests.
+- Merge by candle `time`.
+
+Merge behavior:
+
+- Responses are combined into one response.
+- Candles are keyed by Unix second timestamp.
+- Duplicate timestamps are overwritten by later chunks.
+- Candles are sorted ascending by time after merge.
+- Response metadata generally comes from the first/combined request, with partial/source status merged.
+
+This keeps the UI code simple while protecting the backend from massive single-window requests.
+
+### 4.5 Range Windows
+
+`getRangeWindow(range)` maps UI presets to `{ from, to }` windows ending at current time.
+
+Implemented ranges include more than the visible UI buttons. The type/helper support values such as:
+
+- `1H`
+- `3H`
+- `4H`
+- `6H`
+- `12H`
+- `24H`
+- `7D`
+- `30D`
+- `2M`
+- `6M`
+- `1Y`
+- `ALL`
+
+`ALL` is a large historical range rather than true unbounded history.
+
+### 4.6 Prefetch Windows
+
+The frontend expands the load range beyond the exact visible range. This reduces immediate refetching during small pans or zooms.
+
+Cleanroom behavior:
+
+- Use visible range as the user-facing window.
+- Use a wider load range for backend fetches.
+- Pass both to the backend.
+- Let adaptive timeframe decisions use the visible range, not necessarily the wider prefetch range.
+
+### 4.7 Adaptive Effective Timeframe
+
+The frontend and backend both understand adaptive timeframe behavior.
+
+Concept:
+
+- A user can request a fine timeframe such as `1min`.
+- If the visible range is too wide, the effective timeframe is coarsened.
+- The effective timeframe should never be finer than the minimum safe timeframe for the visible span.
+
+Adaptive order from fine to coarse:
+
+1. `1min`
+2. `5min`
+3. `10min`
+4. `30min`
+5. `1h`
+6. `4h`
+7. `6h`
+8. `12h`
+9. `1d`
+
+Minimum timeframe by visible span:
+
+| Visible span | Minimum timeframe |
+| --- | --- |
+| Up to 1 day | `1min` |
+| Up to 7 days | `5min` |
+| Up to 30 days | `30min` |
+| Up to 90 days | `1h` |
+| Up to 365 days | `4h` |
+| More than 365 days | `12h` |
+
+Effective timeframe is the coarser of:
+
+- requested timeframe
+- minimum timeframe for visible span
+
+Example:
+
+- Requested `1min`, visible range `30D` -> effective `30min`.
+- Requested `1h`, visible range `1H` -> effective `1h`.
+- Requested `4h`, visible range `7D` -> effective `4h`.
+
+### 4.8 Safe Timeframe Helpers
+
+The client exports helpers for allowed/safe timeframe selection, including:
+
+- Determining if a timeframe is allowed for a range.
+- Getting a safe timeframe for a range.
+
+Not all exported helpers are currently used by `App.tsx`, but they are useful if a fork wants stricter UI validation instead of adaptive styling.
+
+## 5. Styling and Layout
+
+### 5.1 Global Theme
+
+Styles are in `moralisCacheSystem/client/src/styles.css`.
+
+The UI uses:
+
+- Dark terminal/trading theme.
+- CSS custom properties for colors.
+- Google Fonts:
+  - `Manrope` for general UI.
+  - `Azeret Mono` for mono/ticker/chart/timeframe styling.
+- Desktop-first layout.
+
+Theme tokens include:
+
+- page background
+- panel background
+- elevated panel color
+- border color
+- muted text
+- main text
+- buy color
+- sell color
+- warning/amber
+- accent green
+
+### 5.2 Layout Grid
+
+Top-level terminal grid:
+
+- Header row: about 52px.
+- Ticker row: about 38px.
+- Workspace row: remaining height.
+
+Workspace columns:
+
+- Left tool rail: about 44px.
+- Chart area: minimum about 720px, flexible.
+- Right ticket panel: about 332px.
+
+Chart zone rows:
+
+- Chart top controls: about 58px.
+- Chart body: minmax about 420px to 1fr.
+- Footer/status row: about 36px.
+
+The chart canvas itself has a minimum height around 420px.
+
+### 5.3 Responsive Behavior
+
+At widths below about 980px:
+
+- Workspace stacks vertically.
+- Tool rail is hidden.
+- Ticker strip becomes a two-column grid.
+- Body minimum width constraints are relaxed.
+
+Default desktop behavior sets a large minimum width, around 1180px, to preserve the terminal layout.
+
+### 5.4 Visual UI Details to Preserve
+
+For a 1:1 fork, preserve these patterns:
+
+- Dark shell with subtle borders and glassy panels.
+- Compact top header with token/pair status.
+- Mono labels for ticker values and timeframe buttons.
+- Green/red market colors.
+- Source/debug color mode.
+- Sticky-feeling chart controls above the chart.
+- Status footer below the chart.
+- Right side order ticket with buy/sell tabs, amount input, slippage chips, and execute button.
+- Left vertical tool rail as visual affordance only.
+
+## 6. Backend Server
+
+### 6.1 Server Construction
+
+The canonical backend is built in `moralisCacheSystem/src/server.ts`.
+
+Server stack:
+
+- Fastify.
+- CORS.
+- Global rate limit plugin.
+- Health route.
+- Moralis compatibility routes.
+- Chart routes.
+- Usage routes.
+- Interaction routes.
+- Admin routes.
+- Central error handler.
+
+Global Fastify rate limit:
+
+- About 600 requests per minute.
+
+Error handling:
+
+- Known `HttpError` instances map to their status code and `{ error }` response.
+- Unknown errors are logged and usually become 500 responses.
+
+### 6.2 API Entrypoint
+
+`moralisCacheSystem/src/index.ts`:
+
+- Checks Redis connectivity.
+- Builds the Fastify server.
+- Listens on configured `PORT`, default 3001.
+- Handles shutdown by closing server, Redis, DB, and queues.
+
+### 6.3 Configuration
+
+Configuration lives in `moralisCacheSystem/src/config.ts`.
+
+It uses environment variables plus `dotenv`. A special loader accepts a raw first non-comment `.env` line without `=` as `MORALIS_API_KEY`.
+
+Chart-relevant variables:
+
+| Variable | Default/role |
+| --- | --- |
+| `PORT` | API port, default 3001. |
+| `LOG_LEVEL` | App log level. |
+| `LOG_FILE` | App log file. |
+| `MORALIS_LOG_FILE` | Moralis provider log file, default under logs. |
+| `INTERACTION_LOG_FILE` | Optional interaction log file. |
+| `INTERACTION_LOG_DIR` | Interaction trace directory, default `logs/interactions`. |
+| `MORALIS_API_KEY` | Required for live Moralis fetches. |
+| `MORALIS_DAILY_CU_BUDGET` | Global daily Moralis CU budget, default about 5,000,000. |
+| `DATABASE_URL` | Postgres connection. |
+| `REDIS_URL` | Redis connection. |
+| `CHART_PROVIDER_ENABLED` | Baseline feature flag for Moralis OHLCV. |
+| `MAX_SYNC_MORALIS_PAGES` | Default max provider pages for sync fetches, default 3. |
+| `MAX_SYNC_GAP_CANDLES` | Max candles fetched synchronously per gap, default about 3000. |
+| `EXTERNAL_API_KEY_REQUEST_RATE_LIMIT` | Compat API request limit, default about 600/min. |
+| `EXTERNAL_API_KEY_CACHE_MISS_RATE_LIMIT` | External key provider-miss limit, default about 20/min. |
+| `EXTERNAL_API_KEY_DAILY_CU_BUDGET` | Per external key daily CU budget, default about 100,000. |
+| `DEFAULT_CURRENCY` | Usually `usd`. |
+| `ADMIN_API_KEY` | Bearer token for admin routes. |
+
+## 7. Main Chart API
+
+### 7.1 Endpoint
+
+Canonical endpoint:
+
+`GET /api/charts/ohlcv`
+
+Implemented in:
+
+`moralisCacheSystem/src/routes/chartRoutes.ts`
+
+Authentication:
+
+- None for first-party chart UI.
+
+Optional headers:
+
+| Header | Purpose |
+| --- | --- |
+| `x-user-id` | Preferred actor identity for Redis chart rate limits. Falls back to request IP. |
+| `x-interaction-id` | Correlates backend trace events with frontend interactions. |
+
+Response headers:
+
+| Header | Meaning |
+| --- | --- |
+| `x-requested-timeframe` | Timeframe selected by client/user. |
+| `x-effective-timeframe` | Timeframe actually used by service. |
+| `x-cache-source` | Response source, for example `cache`, `cache+moralis`, or `partial`. |
+
+### 7.2 Query Validation
+
+The route validates query parameters with Zod.
+
+Required:
+
+| Parameter | Rule |
+| --- | --- |
+| `chain` | Non-empty string. |
+| `pairAddress` | Non-empty string. |
+| `timeframe` | Must be supported OHLCV timeframe. |
+| `from` | ISO datetime string. |
+| `to` | ISO datetime string. |
+
+Optional:
+
+| Parameter | Rule/default |
+| --- | --- |
+| `currency` | `usd` or `native`; defaults to configured default currency. |
+| `visibleFrom` | ISO datetime; defaults to `from`. |
+| `visibleTo` | ISO datetime; defaults to `to`. |
+| `requestedTimeframe` | Supported timeframe; defaults to `timeframe`. |
+
+If `timeframe` is unsupported, validation fails with an unsupported timeframe message.
+
+### 7.3 Response Contract
+
+The backend returns `ChartOhlcvResponse`.
+
+Fields:
+
+| Field | Meaning |
+| --- | --- |
+| `chain` | Normalized/requested chain id. |
+| `pairAddress` | Normalized pair address. |
+| `requestedTimeframe` | Original requested timeframe. |
+| `timeframe` | Effective timeframe. |
+| `currency` | `usd` or `native`. |
+| `from` | Response window start ISO. |
+| `to` | Response window end ISO. |
+| `source` | Response source. |
+| `partial` | Whether response is incomplete/degraded. |
+| `candles` | Dense array of chart candles. |
+
+Possible response sources:
+
+| Source | Meaning |
+| --- | --- |
+| `cache` | Full response served from cache or DB without provider fetch. |
+| `cache+moralis` | DB/cache plus new Moralis data fetched during request. |
+| `partial` | Some data could not be synchronously fetched; cache/DB/filled output returned. |
+| `demo` | Demo/local style data source in local or test paths. |
+
+`ChartCandle` fields:
+
+| Field | Meaning |
+| --- | --- |
+| `time` | Unix seconds. |
+| `timestamp` | ISO datetime. |
+| `open` | Open price. |
+| `high` | High price. |
+| `low` | Low price. |
+| `close` | Close price. |
+| `volume` | Volume, or null. |
+| `trades` | Trade count, or null. |
+| `source` | Optional candle source: `cache`, `moralis`, `demo`, or `filled`. |
+
+### 7.4 Route-Level Service Options
+
+The chart route calls the chart service with tight synchronous provider limits:
+
+- `maxProviderPages: 1`
+- `maxProviderFetches: 1`
+
+This means a single UI chart request can fetch at most one provider page for at most one gap. Larger or additional gaps become partial and/or get backfilled asynchronously.
+
+## 8. Timeframes and Range Limits
+
+### 8.1 Supported Timeframes
+
+Supported backend timeframes are defined in `moralisCacheSystem/src/timeframes.ts` and the shared type union in `moralisCacheSystem/src/types.ts`.
+
+Known supported values include:
+
+- `1s`
+- `10s`
+- `30s`
+- `1min`
+- `5min`
+- `10min`
+- `30min`
+- `1h`
+- `4h`
+- `6h`
+- `12h`
+- `1d`
+- `1w`
+- `1M`
+
+The frontend UI exposes only a subset.
+
+### 8.2 Seconds Per Timeframe
+
+Backend `timeframeSeconds` maps every timeframe to seconds.
+
+Important note:
+
+- `1M` is treated as 30 days for duration estimates.
+- Candle alignment for `1M` uses UTC month start, not just a 30-day Unix bucket.
+
+### 8.3 Adaptive Backend Timeframe
+
+The backend computes effective adaptive timeframe using the visible range.
+
+For `GET /api/charts/ohlcv`:
+
+- `visibleFrom` and `visibleTo` drive the adaptive decision.
+- If omitted, `from` and `to` are used.
+
+For Moralis compatibility routes:
+
+- The full requested page/range drives the adaptive decision.
+- There is no separate visible window in the compat API.
+
+Backend and frontend adaptive thresholds should match to avoid UI/header disagreement.
+
+### 8.4 Range Validation
+
+Before processing, the backend checks:
+
+- `to` must be later than `from`.
+- Estimated candle count must not exceed the maximum synchronous candles allowed for the timeframe.
+
+If a range is too large for its timeframe, the backend rejects the request. In the current code, some invalid chart range errors are plain `Error` values rather than `HttpError`, so they can surface as 500 instead of 400. A clean fork can improve this while preserving behavior if exact status parity is required.
+
+### 8.5 Candle Alignment
+
+The backend aligns ranges to candle starts:
+
+- Most timeframes align by Unix seconds modulo timeframe length.
+- `1M` aligns to the first day of the UTC month.
+
+Gap detection and filled candles depend on this alignment.
+
+## 9. Chain and Pair Handling
+
+### 9.1 Pair Normalization
+
+Pair normalization lives in `moralisCacheSystem/src/pairAddress.ts`.
+
+Rules:
+
+- For EVM-style chains, pair addresses are lowercased.
+- For Solana, pair address case is preserved.
+- Chain comparison for Solana is case-insensitive.
+
+Normalization is used for:
+
+- Chart cache keys.
+- Gap fetch lock keys.
+- Service response identity.
+- Admin backfills.
+- Pair repository bookkeeping.
+
+### 9.2 Chain Slugs on Frontend
+
+Frontend chain display and Dexscreener slug mapping live in:
+
+`moralisCacheSystem/client/src/chains.ts`
+
+The app uses:
+
+- `chainOptions` for the chain selector.
+- `getChainLabel` for display.
+- `getDexscreenerChainSlug` for Dexscreener URL/API path.
+
+### 9.3 Moralis Chain Routing
+
+Moralis provider calls route differently by chain:
+
+For Solana:
+
+- Base URL is `https://solana-gateway.moralis.io/token/mainnet/pairs/{pairAddress}/ohlcv`.
+- No `chain` query parameter is added.
+
+For EVM chains:
+
+- Base URL is `https://deep-index.moralis.io/api/v2.2/pairs/{pairAddress}/ohlcv`.
+- `chain` query parameter is included.
+
+## 10. Chart Service Pipeline
+
+The core orchestration lives in:
+
+`moralisCacheSystem/src/services/chartService.ts`
+
+Conceptual function:
+
+`getOhlcvForChart(input, options)`
+
+### 10.1 Inputs
+
+The service receives:
+
+- `chain`
+- `pairAddress`
+- `timeframe`
+- `requestedTimeframe`
+- `currency`
+- `from`
+- `to`
+- `visibleFrom`
+- `visibleTo`
+- actor identity for rate limiting
+- optional `interactionId`
+- optional `externalApiKeyId`
+- provider fetch limits
+
+### 10.2 Pipeline Overview
+
+The chart request pipeline:
+
+1. Normalize pair address.
+2. Determine effective timeframe.
+3. Validate chart range.
+4. Enforce chart request rate limit.
+5. Touch pair record in `chart_pairs`.
+6. Build Redis response cache key.
+7. Try Redis cached full response.
+8. If full cache hit, return cache-labeled response.
+9. If cache miss or cached partial, query Postgres candles.
+10. Detect missing aligned candle ranges.
+11. Prioritize gaps that overlap the visible window.
+12. Enforce provider cache-miss rate limit if gaps exist.
+13. For each allowed gap:
+    - If too large, enqueue backfill and mark partial.
+    - If sync fetch limit exceeded, mark partial.
+    - Acquire Redis gap lock.
+    - Check CU budget.
+    - Fetch Moralis pages.
+    - Upsert candles.
+    - Log provider usage.
+14. Re-query Postgres candles after provider writes.
+15. Fill missing candles to create a dense output.
+16. Build `ChartOhlcvResponse`.
+17. Cache response in Redis only if not partial.
+18. Return response.
+
+### 10.3 Redis Response Cache
+
+Cache key builder:
+
+`buildChartCacheKey(chain, pairAddress, timeframe, currency, from, to)`
+
+Key format:
+
+`chart:ohlcv:{chain}:{normalizedPair}:{timeframe}:{currency}:{fromISO}:{toISO}`
+
+TTL by timeframe:
+
+| Timeframe class | TTL |
+| --- | --- |
+| Sub-minute timeframes | About 5 seconds. |
+| `1min` | About 15 seconds. |
+| `5min`, `10min` | About 30 seconds. |
+| `30min`, `1h` | About 60 seconds. |
+| Coarser timeframes | About 300 seconds. |
+
+Cache hit behavior:
+
+- Parse JSON response from Redis.
+- If cached response is partial, bypass it and recompute.
+- If full cached response is returned:
+  - Top-level source is normalized to `cache`.
+  - Candle sources are rewritten for cache display unless they are demo candles.
+
+Cache write behavior:
+
+- Only non-partial responses are cached.
+- Partial responses are intentionally not cached so future requests can retry provider fill.
+
+### 10.4 Postgres Candle Lookup
+
+The service queries candles by:
+
+- chain
+- normalized pair address
+- timeframe
+- currency
+- timestamp range
+
+Candles are expected sorted by timestamp ascending for response assembly and gap filling.
+
+### 10.5 Gap Detection
+
+Gap detection lives in `moralisCacheSystem/src/gaps.ts`.
+
+The service:
+
+- Aligns the requested range to candle boundaries.
+- Walks expected candle starts.
+- Compares expected starts against stored candles.
+- Produces missing ranges.
+- Merges adjacent gaps.
+
+Gaps are then prioritized by:
+
+1. Overlap with the visible range.
+2. Distance from the visible range.
+
+This is important when provider fetches are capped: the system tries to fetch what the user can see first.
+
+### 10.6 Cache Miss Rate Limiting
+
+When gaps exist, the service enforces a provider miss limit before calling Moralis.
+
+First-party chart route:
+
+- Uses `enforceProviderMissRateLimit`.
+- Limit is about 10 cache misses per 60 seconds per actor.
+
+External API key route:
+
+- Uses `enforceExternalApiKeyCacheMissRateLimit`.
+- Limit comes from `EXTERNAL_API_KEY_CACHE_MISS_RATE_LIMIT`.
+
+If a miss limit returns 429:
+
+- The service catches this specific limit error.
+- It does not fail the whole chart request.
+- It returns a partial cache/DB/filled response.
+- Provider fetching is skipped for that request.
+
+### 10.7 Synchronous Provider Fetch Limits
+
+Provider fetches can be skipped and marked partial when:
+
+- The route's `maxProviderFetches` has already been reached.
+- The estimated gap candle count exceeds `MAX_SYNC_GAP_CANDLES`.
+- Another request/worker holds the gap lock.
+- Moralis returns a cursor after the configured page cap, meaning the fetch is truncated.
+- Provider miss rate limit was exceeded.
+
+Large gaps are enqueued as backfill jobs instead of blocking the chart route.
+
+### 10.8 Redis Gap Locks
+
+Lock helper:
+
+`withRedisLock(key, ttlMs, fn)`
+
+Gap lock key format:
+
+`lock:ohlcv:{chain}:{normalizedPair}:{timeframe}:{currency}:{from}:{to}`
+
+Behavior:
+
+- `SET key token PX ttl NX`.
+- If lock acquired, run fetch/upsert work.
+- Delete lock only if token still matches.
+- If lock not acquired, return undefined and let caller mark response partial.
+
+Chart service lock TTL is about 30 seconds.
+
+### 10.9 Provider Usage Logging
+
+After a successful Moralis fetch, the service logs usage through `providerUsageRepository.log`.
+
+Logged fields include:
+
+- provider name
+- endpoint
+- chain
+- pair address
+- timeframe
+- currency
+- from/to
+- estimated CU
+- pages
+- HTTP status where available
+- external API key id when applicable
+
+The frontend usage panel reads aggregated data from this log.
+
+### 10.10 Dense Filled Output
+
+The backend returns a dense candle series. Missing bars are filled by `fillMissingChartCandles`.
+
+Fill behavior:
+
+- Walk aligned candle starts from `from` to `min(to, now)`.
+- If a real candle exists, use it.
+- If missing, create a synthetic candle with:
+  - `source: 'filled'`
+  - `volume: 0`
+  - `trades: 0`
+  - OHLC equal to the previous real close when available.
+
+This dense output supports:
+
+- Stable chart rendering.
+- Stable logical range to time inference.
+- Visual indication that data is filled rather than real provider data.
+
+If there is no previous real close, the fill behavior depends on available surrounding data and may omit or create based on current implementation details. A clean fork should preserve the current visual behavior: gaps inside a loaded series should not break the chart.
+
+### 10.11 Partial Response Semantics
+
+`partial: true` means the response is usable but not fully provider-complete for the requested window.
+
+Common partial causes:
+
+- Provider miss rate limit exceeded.
+- Provider disabled.
+- Gap too large for sync fetch and queued for backfill.
+- Sync provider fetch count cap reached.
+- Moralis page cap reached with more pages available.
+- Redis lock held by another request.
+- External key cache-miss budget exceeded.
+
+Top-level `source` becomes:
+
+- explicit override such as `partial`, or
+- `partial` if any gap remains unresolved, or
+- `cache+moralis` if provider fetched during request, or
+- `cache` when served fully from stored data.
+
+## 11. Moralis Provider Integration
+
+### 11.1 Provider Client
+
+Moralis logic lives in:
+
+`moralisCacheSystem/src/moralis.ts`
+
+The provider function fetches OHLCV data with:
+
+- chain
+- pair address
+- timeframe
+- currency
+- from/to range
+- page limit
+- cursor pagination
+
+### 11.2 Enablement Controls
+
+Moralis is enabled only when both conditions allow it:
+
+1. `CHART_PROVIDER_ENABLED` config allows provider fetches.
+2. Redis feature flag `feature:moralis_ohlcv_enabled` is not set to `false`.
+
+Admin route:
+
+`POST /api/admin/moralis/enabled`
+
+sets the Redis feature flag.
+
+### 11.3 API Key Requirement
+
+`MORALIS_API_KEY` is required for live fetches.
+
+If missing:
+
+- Moralis fetch throws.
+- The chart route can return server error unless the path catches/degrades before fetch.
+
+### 11.4 Moralis URLs
+
+EVM:
+
+`https://deep-index.moralis.io/api/v2.2/pairs/{pairAddress}/ohlcv`
+
+Solana:
+
+`https://solana-gateway.moralis.io/token/mainnet/pairs/{pairAddress}/ohlcv`
+
+Common query parameters:
+
+- `timeframe`
+- `currency`
+- `fromDate`
+- `toDate`
+- `limit`
+- `cursor`
+- `chain` for EVM only
+
+Limit:
+
+- Uses up to 1000 candles per provider page.
+
+### 11.5 Pagination and Truncation
+
+The provider loops pages until:
+
+- No cursor remains.
+- `maxPages` is reached.
+
+If a cursor remains after the loop, fetch result is marked truncated. The chart service treats truncated fetches as partial.
+
+### 11.6 CU Budgeting
+
+Estimated cost:
+
+- About 150 CU per Moralis OHLCV page.
+
+Global Moralis budget:
+
+- Before fetching, the provider checks today's estimated CU usage.
+- Budget comes from `MORALIS_DAILY_CU_BUDGET`.
+- If budget would be exceeded, provider fetch fails.
+
+External API key budget:
+
+- When a request is attributed to an external key, the chart service can check per-key daily CU before fetching.
+- Budget comes from `EXTERNAL_API_KEY_DAILY_CU_BUDGET`.
+
+### 11.7 Provider Errors
+
+Non-OK Moralis responses become provider errors.
+
+Current behavior:
+
+- Provider HTTP failures generally propagate.
+- Chart service does not broadly catch all provider errors.
+- Some rate-limit errors are intentionally caught and converted to partial responses, but provider failures can still become 500 responses.
+
+### 11.8 Provider Logging
+
+Moralis logs events to:
+
+- app logger/stdout
+- configured Moralis log file
+- interaction trace log when `interactionId` exists
+
+Trace events include:
+
+- provider fetch start
+- page success
+- page failure
+- provider fetch done
+
+## 12. Database Schema
+
+Migrations live in:
+
+`moralisCacheSystem/migrations`
+
+They are applied lexicographically by:
+
+`moralisCacheSystem/src/scripts/migrate.ts`
+
+The migration runner also creates `schema_migrations` if needed and optionally enables TimescaleDB/hypertable support for candles. Timescale enablement failures are logged and ignored.
+
+### 12.1 `schema_migrations`
+
+Tracks applied migration filenames.
+
+### 12.2 `ohlcv_candles`
+
+Main candle storage table.
+
+Purpose:
+
+- Store canonical OHLCV candles fetched from Moralis.
+- Serve chart requests without repeatedly hitting provider.
+
+Primary key:
+
+`(chain, pair_address, timeframe, currency, timestamp)`
+
+Important columns:
+
+| Column | Purpose |
+| --- | --- |
+| `chain` | Chain id. |
+| `pair_address` | Normalized pair address. |
+| `timeframe` | Candle timeframe. |
+| `currency` | `usd` or `native`. |
+| `timestamp` | Candle start time. |
+| `open` | Open price. |
+| `high` | High price. |
+| `low` | Low price. |
+| `close` | Close price. |
+| `volume` | Optional volume. |
+| `trades` | Optional trade count. |
+| `source` | Data source, default `moralis`. |
+| `updated_at` | Last update time. |
+
+Index:
+
+- Lookup dimensions plus timestamp descending for efficient chart range queries.
+
+Repository:
+
+`moralisCacheSystem/src/repositories/candles.ts`
+
+Repository behavior:
+
+- `findCandles` reads a range.
+- `upsertCandles` inserts/updates candles on primary-key conflict.
+- Upsert writes source as Moralis for provider candles.
+
+### 12.3 `chart_pairs`
+
+Tracks requested pairs.
+
+Purpose:
+
+- Know which pairs are active/hot.
+- Support scheduler refresh.
+- Record request stats.
+
+Primary key:
+
+`(chain, pair_address)`
+
+Important columns:
+
+- metadata fields
+- `is_active`
+- `is_hot`
+- request count
+- `last_requested_at`
+- `last_refreshed_at`
+
+Repository:
+
+`moralisCacheSystem/src/repositories/pairs.ts`
+
+The chart service touches this table on each chart request.
+
+### 12.4 `ohlcv_backfill_jobs`
+
+Tracks historical gap backfills.
+
+Purpose:
+
+- Persist queued background jobs.
+- Track status, priority, reason, attempts, and timestamps.
+
+Used by:
+
+- chart service for large user gaps
+- admin route for manual backfills
+- scheduler for hot pair refresh
+- worker for status updates
+
+Important note:
+
+- Current repository code and SQL appear to have a mismatch around a `generatedId` insert versus the table's `id` column. A clean fork should align this before relying on DB-backed backfill creation.
+
+### 12.5 `provider_api_usage`
+
+Tracks provider calls and estimated CU usage.
+
+Purpose:
+
+- Enforce Moralis daily budget.
+- Enforce external API key daily CU budget.
+- Show usage summary in frontend.
+- Provide operational audit trail.
+
+Important fields:
+
+- provider
+- endpoint
+- chain
+- pair address
+- timeframe
+- currency
+- from/to
+- estimated CU
+- pages
+- HTTP status
+- created_at
+- external API key id after migration 003
+
+Repository:
+
+`moralisCacheSystem/src/repositories/providerUsage.ts`
+
+### 12.6 `external_api_keys`
+
+Added by migration 002.
+
+Purpose:
+
+- Support Moralis-compatible external API routes.
+
+Important fields:
+
+| Column | Purpose |
+| --- | --- |
+| `id` | Key id. |
+| `name` | Human name. |
+| `key_prefix` | Prefix shown in lists. |
+| `key_hash` | SHA-256 hash of full key. |
+| `scopes` | JSON array, default includes `ohlcv:read`. |
+| `active` | Whether key can be used. |
+| `request_count` | Usage count. |
+| `created_at` | Creation timestamp. |
+| `last_used_at` | Last successful auth timestamp. |
+| `revoked_at` | Revoke timestamp. |
+
+Repository:
+
+`moralisCacheSystem/src/repositories/externalApiKeys.ts`
+
+## 13. Repositories
+
+### 13.1 Candle Repository
+
+Path:
+
+`moralisCacheSystem/src/repositories/candles.ts`
+
+Responsibilities:
+
+- Query candles for a pair/timeframe/currency/range.
+- Upsert Moralis candles.
+- Normalize DB rows into service candle objects.
+
+### 13.2 Pair Repository
+
+Path:
+
+`moralisCacheSystem/src/repositories/pairs.ts`
+
+Responsibilities:
+
+- Touch pair records on request.
+- Mark pairs active/hot.
+- Find hot active pairs for scheduler.
+
+### 13.3 Backfill Job Repository
+
+Path:
+
+`moralisCacheSystem/src/repositories/backfillJobs.ts`
+
+Responsibilities:
+
+- Create backfill job DB rows.
+- Mark jobs started.
+- Mark jobs completed.
+- Mark jobs failed.
+
+Cleanroom note:
+
+- Fix the current column mismatch before implementing from this repo's exact code.
+
+### 13.4 Provider Usage Repository
+
+Path:
+
+`moralisCacheSystem/src/repositories/providerUsage.ts`
+
+Responsibilities:
+
+- Log provider calls.
+- Sum estimated CU for daily budget windows.
+- Return usage summary for `/api/usage/moralis`.
+- Sum per external API key when enforcing key budgets.
+
+### 13.5 External API Key Repository
+
+Path:
+
+`moralisCacheSystem/src/repositories/externalApiKeys.ts`
+
+Responsibilities:
+
+- Generate plaintext API keys with prefix.
+- Store only key hash.
+- Find active key by plaintext API key.
+- Mark key used.
+- List keys without exposing plaintext.
+- Revoke keys.
+
+## 14. Background Jobs and Scheduler
+
+### 14.1 Queue
+
+Queue implementation:
+
+`moralisCacheSystem/src/jobs/queue.ts`
+
+Queue name:
+
+`ohlcv-backfill`
+
+Technology:
+
+- BullMQ
+- Redis connection from queue Redis helper
+
+Default job options:
+
+- 3 attempts
+- exponential backoff around 10 seconds
+- keep about 1000 completed jobs
+- keep about 5000 failed jobs
+
+### 14.2 Enqueue Logic
+
+Path:
+
+`moralisCacheSystem/src/jobs/enqueue.ts`
+
+Responsibilities:
+
+- Create DB backfill job record.
+- Add BullMQ job.
+- Use deterministic dedupe job id.
+- Map priority labels to BullMQ numeric priorities.
+
+Priority mapping:
+
+| Priority label | Numeric priority |
+| --- | --- |
+| `high` | 1 |
+| `normal` | 5 |
+| `low` | 10 |
+
+Dedupe id includes:
+
+- chain
+- normalized pair
+- timeframe
+- currency
+- from
+- to
+- reason
+
+### 14.3 Backfill Payload
+
+Payload type:
+
+`BackfillJobPayload` in `moralisCacheSystem/src/types.ts`
+
+Fields include:
+
+- chain
+- pair address
+- timeframe
+- currency
+- from
+- to
+- priority
+- reason
+- optional metadata
+
+Known reasons include:
+
+- user gap
+- admin
+- active refresh
+- daily gap fill type exists in the type union even if not heavily used.
+
+### 14.4 Worker
+
+Worker implementation:
+
+`moralisCacheSystem/src/jobs/backfillWorker.ts`
+
+Worker process entry:
+
+`moralisCacheSystem/src/worker.ts`
+
+Behavior:
+
+1. Consume `ohlcv-backfill` jobs.
+2. Mark DB job started.
+3. Fetch Moralis OHLCV with a higher page cap than the sync chart route.
+4. Upsert candles into Postgres.
+5. Log provider usage.
+6. Mark job completed or failed.
+
+Concurrency:
+
+- Production around 5.
+- Development around 2.
+
+Shutdown:
+
+- `worker.ts` handles SIGINT/SIGTERM.
+- Closes worker, queue, Redis, and DB resources.
+
+### 14.5 Scheduler
+
+Scheduler script:
+
+`moralisCacheSystem/src/scripts/schedule.ts`
+
+Scheduler logic:
+
+`moralisCacheSystem/src/jobs/scheduler.ts`
+
+Behavior:
+
+- Find up to about 500 hot active pairs.
+- Enqueue refresh jobs for recent candles.
+- Current refresh target is roughly last 2 hours, `1min`, `usd`.
+- Uses high priority.
+- Reason is `active_refresh`.
+
+This keeps popular pairs warm without waiting for user-visible gaps.
+
+### 14.6 Backfill Sources
+
+Backfill jobs can be created by:
+
+| Source | Trigger |
+| --- | --- |
+| Chart service | Sync gap too large for request. |
+| Admin route | Manual backfill request. |
+| Scheduler | Hot active pair refresh. |
+
+## 15. Rate Limits and Budgets
+
+### 15.1 Global Fastify Limit
+
+Configured in `server.ts`:
+
+- About 600 requests per minute globally.
+
+### 15.2 Chart Request Rate Limit
+
+Function:
+
+`enforceChartRateLimit`
+
+Path:
+
+`moralisCacheSystem/src/rateLimit.ts`
+
+Actor:
+
+- `user:{x-user-id}` if header exists.
+- `ip:{request.ip}` otherwise.
+
+Limits:
+
+| Scope | Limit |
+| --- | --- |
+| Actor total chart requests | About 120 per 60 seconds. |
+| Actor per pair | About 60 per 60 seconds. |
+
+Implementation:
+
+- Redis `INCR`.
+- Redis `EXPIRE`.
+- 60 second rolling-ish fixed window by key expiry.
+
+### 15.3 Provider Cache Miss Limit
+
+Function:
+
+`enforceProviderMissRateLimit`
+
+Limit:
+
+- About 10 per 60 seconds per actor.
+
+Behavior on exceed:
+
+- Throws 429 `HttpError`.
+- Chart service catches this specific case and returns partial cache-only/fill response.
+
+### 15.4 External API Key Limits
+
+Functions:
+
+- `enforceExternalApiKeyRequestRateLimit`
+- `enforceExternalApiKeyCacheMissRateLimit`
+- `assertExternalApiKeyCuBudgetAvailable`
+
+Limits:
+
+| Limit | Config |
+| --- | --- |
+| Request rate | `EXTERNAL_API_KEY_REQUEST_RATE_LIMIT` |
+| Cache miss/provider rate | `EXTERNAL_API_KEY_CACHE_MISS_RATE_LIMIT` |
+| Daily CU | `EXTERNAL_API_KEY_DAILY_CU_BUDGET` |
+
+### 15.5 Moralis Global CU Budget
+
+Function:
+
+`assertDailyMoralisBudgetAvailable`
+
+Budget:
+
+- `MORALIS_DAILY_CU_BUDGET`.
+
+Cost estimate:
+
+- 150 CU per Moralis page.
+
+The provider checks budget before page fetches based on estimated max page count.
+
+## 16. External API Key and Moralis-Compatible API
+
+### 16.1 Purpose
+
+The project exposes Moralis-shaped endpoints so clients can use this cache service as a drop-in OHLCV proxy with their own API key.
+
+Routes live in:
+
+`moralisCacheSystem/src/routes/moralisCompatRoutes.ts`
+
+### 16.2 Auth
+
+Header:
+
+`X-API-Key`
+
+Auth implementation:
+
+`moralisCacheSystem/src/auth/externalApiKeyAuth.ts`
+
+Rules:
+
+- Header is required.
+- Key must hash to an active DB record.
+- Key must include scope `ohlcv:read`.
+- On success, `last_used_at` and request count are updated.
+- Missing/invalid key returns 401.
+
+### 16.3 Compat Endpoints
+
+EVM-style:
+
+`GET /api/v2.2/pairs/:pairAddress/ohlcv`
+
+Solana-style:
+
+`GET /token/mainnet/pairs/:pairAddress/ohlcv`
+
+Solana route fixes chain to `solana`.
+
+### 16.4 Compat Query
+
+Typical query:
+
+| Parameter | Meaning |
+| --- | --- |
+| `chain` | Optional for EVM route, defaults to `eth`. |
+| `timeframe` | Required supported timeframe. |
+| `fromDate` | ISO start. |
+| `toDate` | ISO end. |
+| `currency` | Optional. |
+| `limit` | Optional page size, clamped. |
+| `cursor` | Optional pagination cursor. |
+
+### 16.5 Compat Response
+
+Response shape:
+
+```json
+{
+  "cursor": null,
+  "result": []
+}
+```
+
+`result` contains Moralis-shaped OHLCV candles rather than the first-party `ChartOhlcvResponse` wrapper.
+
+### 16.6 Compat Pagination
+
+The compat route supports cursor-based pagination.
+
+Cursor behavior:
+
+- Encodes pagination state as base64url JSON.
+- Includes timeframe/window context so incompatible cursors can be rejected.
+- Advances by candle count and timeframe seconds.
+
+Invalid cursor or mismatched timeframe returns bad request.
+
+### 16.7 Compat Headers
+
+The compat route sets:
+
+- `Cache-Control: private, max-age=5`
+- `x-cache-source`
+- `x-moralis-cu-used`
+- `x-requested-timeframe`
+- `x-effective-timeframe`
+- `x-effective-limit`
+- `x-page-from`
+- `x-page-to`
+
+### 16.8 Admin Key Management
+
+Admin routes:
+
+- `POST /api/admin/api-keys`
+- `GET /api/admin/api-keys`
+- `DELETE /api/admin/api-keys/:id`
+
+Auth:
+
+- `Authorization: Bearer {ADMIN_API_KEY}`
+
+Created keys:
+
+- Plaintext key is returned once.
+- DB stores only SHA-256 hash and prefix.
+
+Local helper:
+
+`moralisCacheSystem/src/scripts/ensureLocalExternalApiKey.ts`
+
+This can create or reuse a local external key and write it to `.local-external-api-key`.
+
+## 17. Admin Routes
+
+Admin implementation:
+
+`moralisCacheSystem/src/routes/adminRoutes.ts`
+
+Admin auth:
+
+- Requires `Authorization: Bearer {ADMIN_API_KEY}`.
+- If `ADMIN_API_KEY` is not configured, admin calls return unauthorized.
+
+Important routes:
+
+| Method/path | Purpose |
+| --- | --- |
+| `POST /api/admin/charts/backfill` | Enqueue chart backfill jobs. |
+| `POST /api/admin/moralis/enabled` | Toggle Moralis provider feature flag in Redis. |
+| `POST /api/admin/api-keys` | Create external API key. |
+| `GET /api/admin/api-keys` | List external API keys. |
+| `DELETE /api/admin/api-keys/:id` | Revoke external API key. |
+
+Backfill admin route can enqueue jobs for one or multiple timeframes depending on request body.
+
+## 18. Usage API
+
+Endpoint:
+
+`GET /api/usage/moralis`
+
+Implemented in:
+
+`moralisCacheSystem/src/routes/usageRoutes.ts`
+
+Returns:
+
+- Provider usage summary from `providerUsageRepository.getSummary()`.
+
+Used by:
+
+- Frontend status/usage display.
+
+Failure:
+
+- Frontend treats failures as non-blocking and shows placeholders.
+
+## 19. Interaction Logging and Traceability
+
+### 19.1 Frontend Interaction Events
+
+The frontend logs important user actions to:
+
+`POST /api/debug/interactions`
+
+Examples:
+
+- range selection
+- timeframe selection
+
+Events include:
+
+- interaction id
+- action type
+- chain
+- pair address
+- requested timeframe
+- visible range
+- timestamp
+
+Failures are swallowed on the frontend.
+
+### 19.2 Backend Interaction Route
+
+Route implementation:
+
+`moralisCacheSystem/src/routes/interactionRoutes.ts`
+
+Log writer:
+
+`moralisCacheSystem/src/interactionLog.ts`
+
+Behavior:
+
+- Writes JSONL files.
+- Uses configured interaction log directory.
+- Creates files/directories as needed.
+
+### 19.3 Trace Events
+
+When `x-interaction-id` is present, backend services append trace events.
+
+Chart service events include:
+
+- partial response cache bypassed
+- cache response hit
+- candle cache lookup
+- cache gaps detected
+- provider fetch rate limited cache only
+
+Moralis events include:
+
+- Moralis fetch start
+- Moralis page failed
+- Moralis page ok
+- Moralis fetch done
+
+This allows correlating a UI click with cache, DB, gap, provider, and response behavior.
+
+## 20. Local Memory Server
+
+### 20.1 Purpose
+
+`moralisCacheSystem/src/localIndex.ts` provides a local fallback server that can run without full Postgres/Redis infrastructure.
+
+It is used by startup scripts when Docker/infra is unavailable or as an explicit local dev mode.
+
+### 20.2 Differences From Full Stack
+
+Local mode uses:
+
+- In-process `Map`s for candles.
+- In-process/full-response cache.
+- File-based usage persistence.
+- File-based external API key equality check.
+- Direct Moralis provider calls.
+- Simplified concurrency controls.
+
+It does not use:
+
+- Postgres candle storage.
+- Redis response cache.
+- Redis rate-limit counters.
+- BullMQ workers.
+- DB-backed external API key repository.
+
+### 20.3 Local Provider Limits
+
+Local mode uses strict provider controls:
+
+- Max one provider page per chart request.
+- Max one provider gap per chart request.
+- Per-pair provider fetch cooldown around 60 seconds.
+- Active provider fetch dedupe to avoid duplicate simultaneous calls.
+
+### 20.4 Local Usage Files
+
+Local usage is persisted to files such as:
+
+- `.local-proxy-usage.json`
+- `.local-proxy-usage.jsonl`
+
+Local external key file:
+
+- `.local-external-api-key`
+
+### 20.5 Cleanroom Decision
+
+A clean fork can choose either:
+
+1. Reproduce both full-stack and local-memory modes for developer parity.
+2. Keep only full-stack mode and simplify startup.
+3. Keep only local-memory mode for a lightweight prototype.
+
+For 1:1 behavior with this project, reproduce both modes and the startup fallback behavior.
+
+## 21. Startup Scripts and Package Scripts
+
+### 21.1 Root Startup Scripts
+
+Root scripts:
+
+- `start.ps1`
+- `start.bat`
+- `start-cloudflare-tunnel.ps1`
+
+Main startup behavior in `start.ps1`/`start.bat`:
+
+1. Stop prior dev processes where applicable.
+2. Change into `moralisCacheSystem`.
+3. Optionally run `npm install`.
+4. Ensure `.env` contains `ADMIN_API_KEY=local-admin-key` if needed.
+5. If Docker is unavailable, run `npm run dev:local`.
+6. If Docker is available:
+   - Start Redis and Postgres via Docker Compose.
+   - Run migrations.
+   - Ensure local external API key.
+   - Run API, worker, and frontend together.
+7. On some failures, fall back to local mode.
+
+### 21.2 Package Scripts
+
+Important scripts in `moralisCacheSystem/package.json`:
+
+| Script | Purpose |
+| --- | --- |
+| `dev` | Watch API server with `tsx`. |
+| `dev:local` | Run local memory API and Vite frontend concurrently. |
+| `dev:worker` | Watch worker process. |
+| `dev:all` | Run API, worker, and frontend. |
+| `dev:docker` | Start infra, migrate, and run full dev stack. |
+| `migrate` | Apply SQL migrations. |
+| `local:api-key` | Ensure local external API key. |
+| `schedule` | Enqueue active pair refresh jobs. |
+| `test` | Run Vitest. |
+| `test:e2e` | Run e2e tests. |
+| `test:e2e:full` | Typecheck, frontend typecheck, e2e, and build. |
+| `test:e2e:real` | Migrate and run e2e tests. |
+
+## 22. Testing
+
+### 22.1 E2E Chart Tests
+
+File:
+
+`moralisCacheSystem/src/e2e/chart.e2e.test.ts`
+
+Covers:
+
+- `/api/charts/ohlcv`.
+- Moralis compatibility flow.
+- Adaptive timeframe behavior.
+- Effective limit behavior.
+- Mocked Redis/repositories/Moralis/enqueue interactions.
+
+### 22.2 Migration E2E Test
+
+File:
+
+`moralisCacheSystem/src/e2e/migration.e2e.test.ts`
+
+Covers:
+
+- Applying SQL migrations in a test database environment.
+- Inserting/selecting candle data.
+
+### 22.3 Unit Tests
+
+Known unit tests:
+
+- `moralisCacheSystem/src/gaps.test.ts`
+- `moralisCacheSystem/src/timeframes.test.ts`
+
+These validate gap detection and timeframe/range logic.
+
+### 22.4 Recommended Cleanroom Test Suite
+
+For a clean fork, implement tests for:
+
+- Supported timeframe validation.
+- Adaptive timeframe thresholds.
+- Candle alignment, especially `1M`.
+- Gap detection and merging.
+- Visible gap prioritization.
+- Dense fill behavior.
+- Redis cache key construction.
+- Cache hit source rewriting.
+- Partial response cases.
+- Provider page truncation.
+- Provider disabled behavior.
+- Rate-limit degradation to partial.
+- External API key auth and scopes.
+- Compat cursor pagination.
+- Pair normalization for EVM vs Solana.
+- Frontend request query construction.
+- Chart range and timeframe button behavior.
+- Logical range inference with dense candles.
+
+## 23. Cleanroom Rebuild Specification
+
+This section gives a direct checklist for rebuilding the chart without copying source code.
+
+### 23.1 Minimal Frontend Components
+
+Build these frontend modules:
+
+1. App shell
+   - Owns pair, chain, timeframe, range, visible window, chart response, error/loading, usage, metadata.
+   - Renders header, ticker, chart controls, chart, footer, tool rail, and ticket panel.
+
+2. Chart panel
+   - Wraps Lightweight Charts.
+   - Adds candlestick and volume series.
+   - Maps backend candles to chart data.
+   - Applies debug source colors.
+   - Syncs visible range both directions.
+
+3. API module
+   - Defines shared frontend types.
+   - Builds `/api/charts/ohlcv` URLs.
+   - Handles chunking and merge.
+   - Implements range window helpers.
+   - Implements adaptive timeframe helpers.
+   - Fetches usage and Dexscreener metadata.
+
+4. Chains module
+   - Chain selector options.
+   - Chain labels.
+   - Dexscreener slug mapping.
+
+5. Styles
+   - Dark terminal layout.
+   - Desktop-first grid.
+   - Responsive stack under 980px.
+   - Chart overlays and controls.
+
+### 23.2 Minimal Backend Modules
+
+Build these backend modules:
+
+1. Server
+   - Fastify setup.
+   - CORS.
+   - Global rate limit.
+   - Error handler.
+   - Route registration.
+
+2. Chart route
+   - Validate query.
+   - Determine actor id.
+   - Call chart service.
+   - Set response headers.
+
+3. Chart service
+   - Normalize input.
+   - Validate range.
+   - Enforce rate limits.
+   - Check Redis response cache.
+   - Query candles.
+   - Detect gaps.
+   - Rate-limit provider misses.
+   - Fetch limited provider data under lock.
+   - Upsert candles.
+   - Enqueue backfills for large gaps.
+   - Fill missing candles.
+   - Cache complete responses.
+
+4. Moralis client
+   - Build URLs by chain family.
+   - Handle API key.
+   - Enforce provider enabled flag.
+   - Enforce daily CU budget.
+   - Page by cursor.
+   - Return candles/pages/truncated status.
+
+5. Repositories
+   - Candles.
+   - Pairs.
+   - Backfill jobs.
+   - Provider usage.
+   - External API keys.
+
+6. Jobs
+   - BullMQ queue.
+   - Enqueue helper.
+   - Worker.
+   - Scheduler.
+
+7. Admin and compat routes
+   - Backfill admin.
+   - Moralis enabled toggle.
+   - External API key management.
+   - Moralis-shaped OHLCV routes.
+
+### 23.3 Behavioral Invariants to Preserve
+
+For 1:1 behavior, preserve these invariants:
+
+- Chart candle `time` is Unix seconds.
+- Chart responses include both requested and effective timeframe.
+- Backend returns dense candle arrays.
+- Missing candles are marked `source: 'filled'`.
+- Partial responses are usable and not cached.
+- Full responses are cached by exact chain/pair/timeframe/currency/from/to.
+- Cached candle sources are rewritten to cache-oriented display values.
+- Provider fetches prioritize visible gaps.
+- Sync chart route fetches at most one gap/page by default.
+- Large gaps enqueue background backfill.
+- Rate-limited provider misses return partial rather than failing whole chart.
+- EVM pair addresses are lowercased; Solana pair addresses preserve case.
+- Adaptive timeframe depends on visible range.
+- Frontend does not clear stale candles when a new request errors.
+- Range/timeframe clicks create interaction ids and temporarily suppress chart range feedback.
+- Chart pan/zoom updates widen backend load window but do not aggressively shrink it.
+- Dexscreener metadata and Moralis usage failures are non-blocking.
+
+### 23.4 Known Issues or Sharp Edges
+
+Current implementation details a fork should be aware of:
+
+- `lightweight-charts` may not be explicitly listed in the current root package manifest. Add it in a clean fork.
+- Backfill job repository and SQL migration appear mismatched around `generatedId` versus `id`.
+- Some invalid range errors are plain `Error`, so they can become 500 rather than clean 400 responses.
+- Provider HTTP errors can propagate as server errors; only some rate-limit paths degrade to partial.
+- Browser-direct Dexscreener metadata can fail independently due to CORS/network limits.
+- Logical range inference assumes dense, uniformly spaced candles.
+- `1M` uses approximate seconds for estimates but aligns to UTC month start.
+- Local memory mode and full-stack mode differ significantly; exact dev parity requires implementing both.
+
+## 24. Operational Runbook
+
+### 24.1 Full Stack Development
+
+Expected services:
+
+- Node.js app.
+- Postgres.
+- Redis.
+- BullMQ worker.
+- Vite frontend.
+
+Typical sequence:
+
+1. Install dependencies.
+2. Configure `.env` with Moralis key, database URL, Redis URL, admin key.
+3. Start Postgres and Redis.
+4. Run migrations.
+5. Ensure local external API key if testing compat routes.
+6. Start API server.
+7. Start worker.
+8. Start frontend.
+
+### 24.2 Local Fallback Development
+
+When Docker/infra is unavailable:
+
+1. Run local memory API.
+2. Run Vite frontend.
+3. Use file-based local API key if needed.
+4. Accept that data/cache/usage behavior differs from production.
+
+### 24.3 Monitoring Signals
+
+Watch:
+
+- API logs for request failures.
+- Moralis log file for provider page errors.
+- Provider usage summary for CU burn.
+- Interaction trace files for click-to-fetch debugging.
+- Redis rate-limit keys if users see partial responses.
+- Backfill worker logs and failed BullMQ jobs.
+- Postgres `provider_api_usage` for per-key usage.
+- Postgres `ohlcv_backfill_jobs` for stuck jobs.
+
+### 24.4 Common Failure Modes
+
+| Symptom | Likely cause |
+| --- | --- |
+| Chart shows stale candles plus error | Latest request failed; frontend keeps previous response. |
+| Chart response is partial | Provider miss limit, provider cap, large gap, lock contention, or truncation. |
+| No live data fills | Moralis disabled, missing API key, CU budget exhausted, or provider error. |
+| External compat route returns 401 | Missing/invalid/revoked `X-API-Key` or missing scope. |
+| Admin route returns 401 | Missing/wrong `ADMIN_API_KEY` or config not set. |
+| Scheduler does nothing | No hot active pairs or worker/queue not running. |
+| Pan/zoom does not refetch immediately | Frontend only expands range and debounces zoom updates. |
+| Dexscreener labels missing | Browser-direct metadata fetch failed. |
+
+## 25. File-by-File Reference
+
+### Frontend
+
+| File | Responsibility |
+| --- | --- |
+| `moralisCacheSystem/client/src/main.tsx` | React root bootstrap. |
+| `moralisCacheSystem/client/src/App.tsx` | Main app shell, state, controls, chart fetching, metadata, usage, interaction logging. |
+| `moralisCacheSystem/client/src/ChartPanel.tsx` | Lightweight Charts lifecycle, candlestick/volume series, visible range sync, overlays. |
+| `moralisCacheSystem/client/src/api.ts` | Client types, chart fetch, chunking, merge, range/timeframe helpers, usage and metadata fetch. |
+| `moralisCacheSystem/client/src/chains.ts` | Chain labels and Dexscreener slug mapping. |
+| `moralisCacheSystem/client/src/styles.css` | Dark terminal UI, chart layout, responsive behavior. |
+| `moralisCacheSystem/client/vite.config.ts` | Dev server and API proxy. |
+
+### Backend Core
+
+| File | Responsibility |
+| --- | --- |
+| `moralisCacheSystem/src/index.ts` | API process entry. |
+| `moralisCacheSystem/src/server.ts` | Fastify server construction and route registration. |
+| `moralisCacheSystem/src/config.ts` | Environment configuration. |
+| `moralisCacheSystem/src/types.ts` | Shared backend domain types. |
+| `moralisCacheSystem/src/httpErrors.ts` | HTTP error type/helpers. |
+| `moralisCacheSystem/src/logger.ts` | App/provider logging setup. |
+
+### Chart Backend
+
+| File | Responsibility |
+| --- | --- |
+| `moralisCacheSystem/src/routes/chartRoutes.ts` | First-party chart route. |
+| `moralisCacheSystem/src/services/chartService.ts` | Main cache/DB/gap/provider/fill pipeline. |
+| `moralisCacheSystem/src/timeframes.ts` | Timeframe validation, seconds, adaptive logic, range limits, alignment. |
+| `moralisCacheSystem/src/gaps.ts` | Missing candle range detection. |
+| `moralisCacheSystem/src/cache.ts` | Redis JSON response cache helpers and TTLs. |
+| `moralisCacheSystem/src/moralis.ts` | Moralis provider client, budget checks, provider logging. |
+| `moralisCacheSystem/src/pairAddress.ts` | Pair normalization rules. |
+| `moralisCacheSystem/src/rateLimit.ts` | Redis-backed chart, miss, external key, and CU limits. |
+| `moralisCacheSystem/src/locks.ts` | Redis distributed locks for provider gap fetches. |
+
+### Routes
+
+| File | Responsibility |
+| --- | --- |
+| `moralisCacheSystem/src/routes/moralisCompatRoutes.ts` | Moralis-shaped external OHLCV endpoints. |
+| `moralisCacheSystem/src/routes/adminRoutes.ts` | Admin backfill, provider toggle, API key management. |
+| `moralisCacheSystem/src/routes/usageRoutes.ts` | Moralis usage summary endpoint. |
+| `moralisCacheSystem/src/routes/interactionRoutes.ts` | Debug interaction logging endpoint. |
+
+### Persistence
+
+| File | Responsibility |
+| --- | --- |
+| `moralisCacheSystem/src/db.ts` | Database pool/connection utilities. |
+| `moralisCacheSystem/src/redis.ts` | Redis connection utilities. |
+| `moralisCacheSystem/src/repositories/candles.ts` | Candle queries/upserts. |
+| `moralisCacheSystem/src/repositories/pairs.ts` | Pair tracking/hot-pair lookup. |
+| `moralisCacheSystem/src/repositories/backfillJobs.ts` | Backfill job persistence. |
+| `moralisCacheSystem/src/repositories/providerUsage.ts` | Provider usage logging and summaries. |
+| `moralisCacheSystem/src/repositories/externalApiKeys.ts` | External API key create/list/revoke/auth lookup. |
+
+### Jobs
+
+| File | Responsibility |
+| --- | --- |
+| `moralisCacheSystem/src/jobs/queue.ts` | BullMQ queue creation. |
+| `moralisCacheSystem/src/jobs/enqueue.ts` | Backfill enqueue and dedupe. |
+| `moralisCacheSystem/src/jobs/backfillWorker.ts` | Worker job processor. |
+| `moralisCacheSystem/src/jobs/scheduler.ts` | Hot active pair refresh scheduling. |
+| `moralisCacheSystem/src/worker.ts` | Worker process entry. |
+| `moralisCacheSystem/src/scripts/schedule.ts` | Scheduler script entry. |
+
+### Local and Scripts
+
+| File | Responsibility |
+| --- | --- |
+| `moralisCacheSystem/src/localIndex.ts` | Memory-only local API/server. |
+| `moralisCacheSystem/src/scripts/migrate.ts` | SQL migration runner. |
+| `moralisCacheSystem/src/scripts/ensureLocalExternalApiKey.ts` | Local external key helper. |
+| `start.ps1` | Windows PowerShell startup orchestration. |
+| `start.bat` | Windows batch startup orchestration. |
+| `start-cloudflare-tunnel.ps1` | Cloudflare tunnel helper. |
+
+## 26. Summary
+
+The chart is not just a frontend component. It is a complete OHLCV caching system:
+
+- The frontend manages pair/range/timeframe state, adaptive windows, visual chart rendering, and non-blocking metadata/usage panels.
+- The backend provides a dense OHLCV API backed by Redis response cache and Postgres candle storage.
+- Moralis is used only to fill missing gaps, with strict sync limits, CU budgets, feature flags, and usage logging.
+- Partial responses are an intentional degradation mode, not necessarily an error.
+- Background workers handle large historical gaps.
+- External API keys and Moralis-compatible routes let third-party callers use the cache as a proxy.
+- Local memory mode exists for development fallback and differs from production persistence.
+
+For a cleanroom fork, reproduce the contracts and invariants first: request/response shapes, adaptive timeframe rules, dense candle behavior, cache/partial semantics, pair normalization, provider limits, and chart range synchronization. The visual UI can then be rebuilt around those stable behaviors to achieve a 1:1 user experience.

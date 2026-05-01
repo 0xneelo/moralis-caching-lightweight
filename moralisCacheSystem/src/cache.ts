@@ -1,4 +1,5 @@
 import { redis } from './redis.js';
+import { normalizePairAddress } from './pairAddress.js';
 import type { OhlcvTimeframe } from './types.js';
 
 export function buildChartCacheKey(params: {
@@ -13,7 +14,7 @@ export function buildChartCacheKey(params: {
     'chart',
     'ohlcv',
     params.chain,
-    params.pairAddress.toLowerCase(),
+    normalizePairAddress(params.chain, params.pairAddress),
     params.timeframe,
     params.currency,
     params.from.toISOString(),

@@ -1,4 +1,5 @@
 import { backfillJobRepository } from '../repositories/backfillJobs.js';
+import { normalizePairAddress } from '../pairAddress.js';
 import type { BackfillJobPayload } from '../types.js';
 import { getBackfillQueue } from './queue.js';
 
@@ -36,10 +37,12 @@ function priorityToNumber(priority: BackfillJobPayload['priority']) {
 }
 
 function dedupeJobId(params: Omit<BackfillJobPayload, 'dbJobId'>) {
+  const pairAddress = normalizePairAddress(params.chain, params.pairAddress);
+
   return [
     'backfill',
     params.chain,
-    params.pairAddress.toLowerCase(),
+    pairAddress,
     params.timeframe,
     params.currency,
     params.from,

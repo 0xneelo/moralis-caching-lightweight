@@ -5,6 +5,11 @@ logs/
 .env
 .env.*
 !.env.example
+moralisCacheSystem/.local-external-api-key
+moralisCacheSystem/.local-proxy-usage.json
+moralisCacheSystem/.local-proxy-usage.jsonl
 npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*
+tools/
+cloudflared-credentials.json
