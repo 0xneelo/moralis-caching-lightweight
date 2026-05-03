@@ -58,6 +58,10 @@ export type ChartOhlcvResponse = {
   to: string;
   source: 'cache' | 'cache+moralis' | 'partial' | 'demo';
   partial: boolean;
+  historyComplete: boolean;
+  historyWarming: boolean;
+  historyProgressPct: number | null;
+  marketStart: string | null;
   candles: ChartCandle[];
 };
 
@@ -66,7 +70,12 @@ export type TimeRange = {
   to: Date;
 };
 
-export type BackfillReason = 'admin' | 'user_gap' | 'active_refresh' | 'daily_gap_fill';
+export type BackfillReason =
+  | 'admin'
+  | 'user_gap'
+  | 'active_refresh'
+  | 'daily_gap_fill'
+  | 'initial_history_load';
 
 export type BackfillJobPayload = {
   dbJobId?: string;

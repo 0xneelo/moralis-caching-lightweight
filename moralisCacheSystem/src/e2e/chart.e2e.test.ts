@@ -13,6 +13,14 @@ const state = vi.hoisted(() => {
 
   return {
     redisStore: new Map<string, string>(),
+    marketHistoryState: new Map<
+      string,
+      {
+        fullHistoryStatus: 'unknown' | 'queued' | 'running' | 'complete' | 'failed';
+        marketStartTs: Date | null;
+        latestSyncedTs: Date | null;
+      }
+    >(),
     candles: [] as Array<{
       chain: string;
       pairAddress: string;
@@ -179,6 +187,96 @@ vi.mock('../repositories/providerUsage.js', () => ({
   },
 }));
 
+vi.mock('../repositories/marketHistoryState.js', () => ({
+  marketHistoryStateRepository: {
+    async get(params: { chain: string; pairAddress: string; timeframe: string; currency: string }) {
+      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+      const stateEntry = state.marketHistoryState.get(key);
+      if (!stateEntry) {
+        return null;
+      }
+      return {
+        chain: params.chain,
+        pairAddress: params.pairAddress,
+        timeframe: params.timeframe,
+        currency: params.currency,
+        historyFloorTs: new Date('2024-01-01T00:00:00.000Z'),
+        marketStartTs: stateEntry.marketStartTs,
+        latestSyncedTs: stateEntry.latestSyncedTs,
+        fullHistoryStatus: stateEntry.fullHistoryStatus,
+        fullHistoryJobId: null,
+        fullHistoryRequestedAt: null,
+        fullHistoryCompletedAt: null,
+        fullHistoryError: null,
+        updatedAt: new Date('2026-04-28T00:00:00.000Z'),
+      };
+    },
+    async markQueued(params: { chain: string; pairAddress: string; timeframe: string; currency: string }) {
+      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+      const existing = state.marketHistoryState.get(key);
+      state.marketHistoryState.set(key, {
+        fullHistoryStatus: 'queued',
+        marketStartTs: existing?.marketStartTs ?? null,
+        latestSyncedTs: existing?.latestSyncedTs ?? null,
+      });
+    },
+    async markRunning(params: { chain: string; pairAddress: string; timeframe: string; currency: string }) {
+      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+      const existing = state.marketHistoryState.get(key);
+      state.marketHistoryState.set(key, {
+        fullHistoryStatus: 'running',
+        marketStartTs: existing?.marketStartTs ?? null,
+        latestSyncedTs: existing?.latestSyncedTs ?? null,
+      });
+    },
+    async markCompleted(params: {
+      chain: string;
+      pairAddress: string;
+      timeframe: string;
+      currency: string;
+      marketStartTs: Date | null;
+      latestSyncedTs: Date | null;
+    }) {
+      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+      state.marketHistoryState.set(key, {
+        fullHistoryStatus: 'complete',
+        marketStartTs: params.marketStartTs,
+        latestSyncedTs: params.latestSyncedTs,
+      });
+    },
+    async markFailed(params: { chain: string; pairAddress: string; timeframe: string; currency: string }) {
+      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+      const existing = state.marketHistoryState.get(key);
+      state.marketHistoryState.set(key, {
+        fullHistoryStatus: 'failed',
+        marketStartTs: existing?.marketStartTs ?? null,
+        latestSyncedTs: existing?.latestSyncedTs ?? null,
+      });
+    },
+    async upsertBoundsFromCandles(params: {
+      chain: string;
+      pairAddress: string;
+      timeframe: string;
+      currency: string;
+      candles: Array<{ timestamp: string }>;
+    }) {
+      if (params.candles.length === 0) return;
+      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+      const timestamps = params.candles.map((candle) => new Date(candle.timestamp).getTime());
+      const min = new Date(Math.min(...timestamps));
+      const max = new Date(Math.max(...timestamps));
+      const existing = state.marketHistoryState.get(key);
+      state.marketHistoryState.set(key, {
+        fullHistoryStatus: existing?.fullHistoryStatus ?? 'unknown',
+        marketStartTs:
+          existing?.marketStartTs && existing.marketStartTs < min ? existing.marketStartTs : min,
+        latestSyncedTs:
+          existing?.latestSyncedTs && existing.latestSyncedTs > max ? existing.latestSyncedTs : max,
+      });
+    },
+  },
+}));
+
 vi.mock('../repositories/externalApiKeys.js', () => ({
   externalApiKeyRepository: {
     async create(params: { name: string; scopes?: string[] }) {
@@ -291,6 +389,7 @@ vi.mock('../moralis.js', () => ({
 describe('chart API E2E', () => {
   beforeEach(() => {
     state.redisStore.clear();
+    state.marketHistoryState.clear();
     state.candles.length = 0;
     state.providerUsage.length = 0;
     state.backfillJobs.length = 0;

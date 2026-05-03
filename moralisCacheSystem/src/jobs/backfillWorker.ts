@@ -5,6 +5,7 @@ import { fetchMoralisOhlcv } from '../moralis.js';
 import { normalizePairAddress } from '../pairAddress.js';
 import { backfillJobRepository } from '../repositories/backfillJobs.js';
 import { candleRepository } from '../repositories/candles.js';
+import { marketHistoryStateRepository } from '../repositories/marketHistoryState.js';
 import { providerUsageRepository } from '../repositories/providerUsage.js';
 import { createQueueRedisConnection } from '../redis.js';
 import type { BackfillJobPayload } from '../types.js';
@@ -21,6 +22,14 @@ export function createBackfillWorker() {
       if (dbJobId) {
         await backfillJobRepository.markStarted(dbJobId);
       }
+      if (payload.reason === 'initial_history_load') {
+        await marketHistoryStateRepository.markRunning({
+          chain: payload.chain,
+          pairAddress,
+          timeframe: payload.timeframe,
+          currency: payload.currency,
+        });
+      }
 
       try {
         const result = await fetchMoralisOhlcv({
@@ -34,6 +43,13 @@ export function createBackfillWorker() {
         });
 
         const upsertResult = await candleRepository.upsertCandles({
+          chain: payload.chain,
+          pairAddress,
+          timeframe: payload.timeframe,
+          currency: payload.currency,
+          candles: result.candles,
+        });
+        await marketHistoryStateRepository.upsertBoundsFromCandles({
           chain: payload.chain,
           pairAddress,
           timeframe: payload.timeframe,
@@ -62,6 +78,33 @@ export function createBackfillWorker() {
             candlesInserted: upsertResult.inserted,
           });
         }
+        if (payload.reason === 'initial_history_load') {
+          const bounds = await candleRepository.getBounds({
+            chain: payload.chain,
+            pairAddress,
+            timeframe: payload.timeframe,
+            currency: payload.currency,
+          });
+
+          if (!result.truncated) {
+            await marketHistoryStateRepository.markCompleted({
+              chain: payload.chain,
+              pairAddress,
+              timeframe: payload.timeframe,
+              currency: payload.currency,
+              marketStartTs: bounds.minTimestamp,
+              latestSyncedTs: bounds.maxTimestamp,
+            });
+          } else {
+            await marketHistoryStateRepository.markFailed({
+              chain: payload.chain,
+              pairAddress,
+              timeframe: payload.timeframe,
+              currency: payload.currency,
+              errorMessage: 'Initial history load truncated before completion',
+            });
+          }
+        }
 
         if (result.truncated) {
           logger.warn({ payload }, 'Backfill reached maxPages and may be incomplete');
@@ -70,6 +113,15 @@ export function createBackfillWorker() {
         if (dbJobId) {
           await backfillJobRepository.markFailed({
             dbJobId,
+            errorMessage: error instanceof Error ? error.message : 'Unknown error',
+          });
+        }
+        if (payload.reason === 'initial_history_load') {
+          await marketHistoryStateRepository.markFailed({
+            chain: payload.chain,
+            pairAddress,
+            timeframe: payload.timeframe,
+            currency: payload.currency,
             errorMessage: error instanceof Error ? error.message : 'Unknown error',
           });
         }

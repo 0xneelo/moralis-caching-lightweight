@@ -55,6 +55,10 @@ export type ChartResponse = {
   to: string;
   source: 'cache' | 'cache+moralis' | 'partial' | 'demo';
   partial: boolean;
+  historyComplete: boolean;
+  historyWarming: boolean;
+  historyProgressPct: number | null;
+  marketStart: string | null;
   candles: ChartCandle[];
 };
 
@@ -67,6 +71,7 @@ export type ChartRequest = {
   to: Date;
   visibleFrom?: Date | undefined;
   visibleTo?: Date | undefined;
+  refreshFromMoralis?: boolean | undefined;
   signal?: AbortSignal;
   interactionId?: string | undefined;
 };
@@ -138,7 +143,10 @@ export async function fetchChartCandles(params: ChartRequest) {
     requestedTimeframe: params.timeframe,
     timeframe: effectiveTimeframe,
   };
-  const chunks = getRequestChunks(effectiveParams);
+  const chunks = prioritizeChunksByVisibleRange(getRequestChunks(effectiveParams), {
+    from: params.visibleFrom ?? normalizedWindow.from,
+    to: params.visibleTo ?? normalizedWindow.to,
+  });
 
   if (chunks.length === 1) {
     return fetchChartCandlesOnce({ ...effectiveParams, ...chunks[0]! });
@@ -154,22 +162,30 @@ export async function fetchChartCandles(params: ChartRequest) {
 }
 
 export function getPrefetchWindow(visibleRange: TimeWindow, timeframe: Timeframe): TimeWindow {
+  const now = new Date();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const clampedVisibleTo = new Date(Math.min(visibleRange.to.getTime(), now.getTime()));
+  const clampedVisibleFrom = new Date(Math.min(visibleRange.from.getTime(), clampedVisibleTo.getTime()));
   const maxPrefetchMs =
     maxRequestCandlesByTimeframe[timeframe] *
     timeframeSeconds[timeframe] *
     1000;
-  const visibleSpanMs = Math.max(0, visibleRange.to.getTime() - visibleRange.from.getTime());
+  const visibleSpanMs = Math.max(0, clampedVisibleTo.getTime() - clampedVisibleFrom.getTime());
   const allHistoryFrom = new Date('2024-01-01T00:00:00.000Z');
-  const oldestSafeFrom = new Date(visibleRange.to.getTime() - maxPrefetchMs);
-  const prefetchFrom =
-    visibleSpanMs > maxPrefetchMs
-      ? oldestSafeFrom
-      : new Date(Math.min(visibleRange.from.getTime(), oldestSafeFrom.getTime()));
+  const oldestSafeFrom = new Date(clampedVisibleTo.getTime() - maxPrefetchMs);
+
+  // Keep normal ranges focused on what the user can see. The old logic expanded
+  // 7D + 4h to ~833 days, causing old-history cache/gap work before visible
+  // candles loaded. Only true huge/ALL windows may use the max provider window.
+  const paddingMs = Math.min(visibleSpanMs, 30 * dayMs, Math.floor(maxPrefetchMs / 2));
+  const prefetchFrom = visibleSpanMs >= maxPrefetchMs
+    ? oldestSafeFrom
+    : new Date(clampedVisibleFrom.getTime() - paddingMs);
   const from = new Date(Math.max(allHistoryFrom.getTime(), prefetchFrom.getTime()));
 
   return normalizeWindowForTimeframe({
     from,
-    to: visibleRange.to,
+    to: clampedVisibleTo,
   }, timeframe);
 }
 
@@ -200,6 +216,9 @@ async function fetchChartCandlesOnce(params: ChartRequest & { requestedTimeframe
   }
   if (params.visibleTo) {
     url.searchParams.set('visibleTo', params.visibleTo.toISOString());
+  }
+  if (params.refreshFromMoralis) {
+    url.searchParams.set('refreshFromMoralis', 'true');
   }
 
   const headers = params.interactionId ? { 'x-interaction-id': params.interactionId } : undefined;
@@ -236,10 +255,41 @@ function getRequestChunks(params: ChartRequest): TimeWindow[] {
   return chunks;
 }
 
+function prioritizeChunksByVisibleRange(chunks: TimeWindow[], visibleRange: TimeWindow) {
+  return [...chunks].sort((left, right) => {
+    const leftVisible = timeWindowsOverlap(left, visibleRange);
+    const rightVisible = timeWindowsOverlap(right, visibleRange);
+
+    if (leftVisible !== rightVisible) {
+      return leftVisible ? -1 : 1;
+    }
+
+    return distanceToTimeWindow(left, visibleRange) - distanceToTimeWindow(right, visibleRange);
+  });
+}
+
+function timeWindowsOverlap(left: TimeWindow, right: TimeWindow) {
+  return left.from < right.to && left.to > right.from;
+}
+
+function distanceToTimeWindow(window: TimeWindow, target: TimeWindow) {
+  if (timeWindowsOverlap(window, target)) {
+    return 0;
+  }
+
+  if (window.to <= target.from) {
+    return target.from.getTime() - window.to.getTime();
+  }
+
+  return window.from.getTime() - target.to.getTime();
+}
+
 function normalizeWindowForTimeframe(range: TimeWindow, timeframe: Timeframe): TimeWindow {
   const stepMs = timeframeSeconds[timeframe] * 1000;
   const from = new Date(Math.floor(range.from.getTime() / stepMs) * stepMs);
-  const to = new Date(Math.max(from.getTime() + stepMs, Math.floor(range.to.getTime() / stepMs) * stepMs));
+  // Use ceil for `to` so the currently-forming candle is included. Flooring `to`
+  // excludes today's 1d candle for very new tokens created after midnight UTC.
+  const to = new Date(Math.max(from.getTime() + stepMs, Math.ceil(range.to.getTime() / stepMs) * stepMs));
 
   return { from, to };
 }
@@ -256,6 +306,10 @@ function mergeChartResponses(
     }
   }
 
+  const historyProgressValues = responses
+    .map((response) => response.historyProgressPct)
+    .filter((value): value is number => typeof value === 'number');
+
   return {
     chain: params.chain,
     pairAddress: params.pairAddress,
@@ -266,6 +320,14 @@ function mergeChartResponses(
     to: params.to.toISOString(),
     source: mergeSources(responses.map((response) => response.source)),
     partial: responses.some((response) => response.partial),
+    historyComplete: responses.every((response) => response.historyComplete),
+    historyWarming: responses.some((response) => response.historyWarming),
+    historyProgressPct:
+      historyProgressValues.length > 0 ? Math.max(...historyProgressValues, 0) : null,
+    marketStart: responses
+      .map((response) => response.marketStart)
+      .filter((value): value is string => typeof value === 'string')
+      .sort()[0] ?? null,
     candles: [...candlesByTime.values()].sort((a, b) => a.time - b.time),
   };
 }

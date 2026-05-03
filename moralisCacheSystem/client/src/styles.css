@@ -72,6 +72,7 @@ button {
 .topbar-actions,
 .pair-title,
 .timeframe-row,
+.refresh-row,
 .chart-footer,
 .side-toggle,
 .quick-pills,
@@ -121,6 +122,7 @@ button {
 .connect-button,
 .mode-toggle,
 .timeframe-row button,
+.refresh-moralis-button,
 .tool-rail button,
 .side-toggle button,
 .quick-pills button,
@@ -232,7 +234,9 @@ button {
 .chart-zone {
   min-width: 0;
   display: grid;
-  grid-template-rows: 58px minmax(420px, 1fr) 36px;
+  /* Header must grow with controls (range + timeframe + refresh); a fixed 58px row
+     overflowed under the chart canvas and stole clicks from the refresh button. */
+  grid-template-rows: auto minmax(420px, 1fr) 36px;
   background:
     linear-gradient(90deg, oklch(100% 0 0 / 3%) 1px, transparent 1px),
     linear-gradient(0deg, oklch(100% 0 0 / 3%) 1px, transparent 1px),
@@ -245,8 +249,11 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-lg);
-  padding: 0 var(--space-xl);
+  padding: var(--space-sm) var(--space-xl);
   border-bottom: 1px solid var(--line);
+  position: relative;
+  z-index: 2;
+  background: oklch(14.5% 0.038 270);
 }
 
 .pair-title {
@@ -267,6 +274,10 @@ button {
   gap: var(--space-xs);
 }
 
+.refresh-row {
+  justify-content: flex-end;
+}
+
 .chart-controls {
   display: grid;
   justify-items: end;
@@ -280,6 +291,30 @@ button {
   color: var(--muted);
   font-family: 'Azeret Mono', ui-monospace, monospace;
   font-size: 11px;
+}
+
+.refresh-moralis-button {
+  height: 30px;
+  border-radius: 8px;
+  padding: 0 var(--space-md);
+  color: var(--text);
+  font-family: 'Azeret Mono', ui-monospace, monospace;
+  font-size: 11px;
+  background: oklch(67% 0.19 261 / 28%);
+  border-color: oklch(75% 0.12 262 / 45%);
+}
+
+.refresh-moralis-button:hover {
+  transform: translateY(-1px);
+  border-color: oklch(76% 0.15 262 / 58%);
+}
+
+.refresh-moralis-button:disabled {
+  cursor: not-allowed;
+  transform: none;
+  color: oklch(60% 0.03 276);
+  background: oklch(17% 0.03 270 / 80%);
+  border-color: oklch(40% 0.04 270 / 24%);
 }
 
 .timeframe-row button.active {
@@ -334,6 +369,39 @@ button {
 .chart-error small {
   max-width: 620px;
   color: oklch(78% 0.09 356);
+}
+
+.chart-warmup {
+  backdrop-filter: blur(1px);
+}
+
+.chart-warmup span {
+  color: var(--warning);
+}
+
+.chart-warmup small {
+  max-width: 520px;
+}
+
+.chart-warmup-spinner {
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  border: 3px solid oklch(88% 0.14 82 / 18%);
+  border-top-color: var(--warning);
+  border-right-color: oklch(67% 0.19 261);
+  margin: 0 auto 8px;
+  animation: chart-warmup-spin 900ms linear infinite;
+}
+
+@keyframes chart-warmup-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .chart-footer {

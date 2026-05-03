@@ -48,5 +48,7 @@ function dedupeJobId(params: Omit<BackfillJobPayload, 'dbJobId'>) {
     params.from,
     params.to,
     params.reason,
-  ].join(':');
+  ]
+    .map((part) => part.replaceAll(':', '-'))
+    .join('__');
 }

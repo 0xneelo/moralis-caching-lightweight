@@ -8,7 +8,7 @@ export const backfillJobRepository = {
     const result = await query<{ id: string }>(
       `
       INSERT INTO ohlcv_backfill_jobs (
-        generatedId,
+        id,
         chain,
         pair_address,
         timeframe,

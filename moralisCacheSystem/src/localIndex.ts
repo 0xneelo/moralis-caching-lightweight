@@ -24,11 +24,21 @@ const DEFAULT_MORALIS_COMPAT_LIMIT = 100;
 const LOCAL_MAX_PROVIDER_PAGES_PER_CHART_REQUEST = 1;
 const LOCAL_MAX_PROVIDER_GAPS_PER_CHART_REQUEST = 1;
 const LOCAL_PROVIDER_FETCH_COOLDOWN_MS = 60_000;
+const LOCAL_HISTORY_FLOOR = new Date('2024-01-01T00:00:00.000Z');
 const LOCAL_EXTERNAL_API_KEY_FILE = '.local-external-api-key';
 const LOCAL_PROXY_USAGE_FILE = '.local-proxy-usage.json';
 const LOCAL_PROXY_USAGE_EVENTS_FILE = '.local-proxy-usage.jsonl';
 const candles = new Map<string, ChartCandle[]>();
 const responses = new Map<string, unknown>();
+const marketHistoryState = new Map<
+  string,
+  {
+    historyComplete: boolean;
+    historyWarming: boolean;
+    historyProgressPct: number | null;
+    marketStart: string | null;
+  }
+>();
 const activeProviderFetches = new Set<string>();
 const providerFetchCooldowns = new Map<string, number>();
 
@@ -206,6 +216,23 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
     from,
     to,
   });
+  const historyKey = buildHistoryStateKey({
+    chain: parsed.data.chain,
+    pairAddress,
+    timeframe: effectiveTimeframe,
+    currency: parsed.data.currency,
+  });
+  const historyState = marketHistoryState.get(historyKey) ?? {
+    historyComplete: false,
+    historyWarming: false,
+    historyProgressPct: null,
+    marketStart: null,
+  };
+  const fullHistoryRequested = isLocalFullHistoryRangeRequest({
+    timeframe: effectiveTimeframe,
+    from,
+    to,
+  });
 
   const cachedResponse = responses.get(responseKey);
   if (cachedResponse && isPartialChartResponse(cachedResponse)) {
@@ -221,7 +248,7 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
     });
   }
 
-  if (cachedResponse && !isPartialChartResponse(cachedResponse)) {
+  if (cachedResponse && !isPartialChartResponse(cachedResponse) && !(fullHistoryRequested && !historyState.historyComplete)) {
     await appendInteractionTraceEvent(interactionId, 'cache_response_hit', {
       route: '/api/charts/ohlcv',
       chain: parsed.data.chain,
@@ -231,6 +258,7 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
       from: from.toISOString(),
       to: to.toISOString(),
       cacheKey: responseKey,
+      historyComplete: historyState.historyComplete,
     });
     const cacheDebugResponse = markCachedResponseCandles(cachedResponse);
     reply.header('x-requested-timeframe', requestedTimeframe);
@@ -243,7 +271,36 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
     ) {
       reply.header('x-cache-source', cacheDebugResponse.source);
     }
-    return cacheDebugResponse;
+    if (typeof cacheDebugResponse === 'object' && cacheDebugResponse !== null) {
+      return {
+        ...cacheDebugResponse,
+        historyComplete: historyState.historyComplete,
+        historyWarming: historyState.historyWarming,
+        historyProgressPct: historyState.historyProgressPct,
+        marketStart: historyState.marketStart,
+      };
+    }
+
+    return {
+      historyComplete: historyState.historyComplete,
+      historyWarming: historyState.historyWarming,
+      historyProgressPct: historyState.historyProgressPct,
+      marketStart: historyState.marketStart,
+      candles: [],
+    };
+  }
+
+  if (cachedResponse && !isPartialChartResponse(cachedResponse) && fullHistoryRequested && !historyState.historyComplete) {
+    await appendInteractionTraceEvent(interactionId, 'history_incomplete_cache_bypassed', {
+      route: '/api/charts/ohlcv',
+      chain: parsed.data.chain,
+      pairAddress,
+      requestedTimeframe,
+      effectiveTimeframe,
+      from: from.toISOString(),
+      to: to.toISOString(),
+      cacheKey: responseKey,
+    });
   }
 
   const candleKey = buildCandleKey({
@@ -281,6 +338,10 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
   let responseSource: 'cache' | 'cache+moralis' | 'partial' | 'demo' =
     gaps.length === 0 ? 'cache' : 'partial';
   let partial = gaps.length > 0;
+  let marketStart = historyState.marketStart;
+  let historyComplete = historyState.historyComplete;
+  let historyWarming = historyState.historyWarming || (fullHistoryRequested && !historyState.historyComplete);
+  let historyProgressPct = historyState.historyProgressPct;
 
   if (gaps.length > 0) {
     await appendInteractionTraceEvent(interactionId, 'cache_gaps_detected', {
@@ -399,6 +460,19 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
             for (const candle of fetchedCandles) {
               moralisCandleTimes.add(candle.time);
             }
+            if (fetchedCandles.length > 0) {
+              const earliestFetched = fetchedCandles[0];
+              const latestFetched = fetchedCandles.at(-1);
+              if (earliestFetched) {
+                marketStart =
+                  !marketStart || earliestFetched.timestamp < marketStart
+                    ? earliestFetched.timestamp
+                    : marketStart;
+              }
+              if (!historyComplete && latestFetched) {
+                historyProgressPct = computeLocalHistoryProgressPct(effectiveTimeframe, latestFetched.timestamp);
+              }
+            }
             stored = mergeCandles(stored, fetchedCandles);
             const remainingGaps = findMissingRanges({
               candles: filterCandles(stored, gap.from, gap.to).map((candle) => ({
@@ -483,8 +557,36 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
     to: to.toISOString(),
     source: responseSource,
     partial,
+    historyComplete,
+    historyWarming,
+    historyProgressPct,
+    marketStart,
     candles: finalCandles,
   };
+
+  if (fullHistoryRequested && !partial) {
+    historyComplete = true;
+    historyWarming = false;
+    historyProgressPct = 100;
+    if (!marketStart) {
+      marketStart = finalCandles.find((candle) => candle.source !== 'filled')?.timestamp ?? null;
+    }
+    response.historyComplete = historyComplete;
+    response.historyWarming = historyWarming;
+    response.historyProgressPct = historyProgressPct;
+    response.marketStart = marketStart;
+  } else if (!historyComplete && gaps.length > 0) {
+    historyWarming = true;
+    response.historyWarming = true;
+    response.historyProgressPct = historyProgressPct ?? 0;
+  }
+
+  marketHistoryState.set(historyKey, {
+    historyComplete,
+    historyWarming,
+    historyProgressPct,
+    marketStart,
+  });
 
   reply.header('x-requested-timeframe', requestedTimeframe);
   reply.header('x-effective-timeframe', effectiveTimeframe);
@@ -744,12 +846,46 @@ function buildCandleKey(params: {
   return [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
 }
 
+function buildHistoryStateKey(params: {
+  chain: string;
+  pairAddress: string;
+  timeframe: string;
+  currency: string;
+}) {
+  return ['history', params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+}
+
 function buildProviderFetchKey(params: {
   chain: string;
   pairAddress: string;
   currency: string;
 }) {
   return [params.chain, params.pairAddress, params.currency].join(':');
+}
+
+function isLocalFullHistoryRangeRequest(params: {
+  timeframe: OhlcvTimeframe;
+  from: Date;
+  to: Date;
+}) {
+  const timeframeMs = timeframeSeconds[params.timeframe] * 1000;
+  const nearNowThreshold = Date.now() - timeframeMs * 2;
+  return params.from.getTime() <= LOCAL_HISTORY_FLOOR.getTime() && params.to.getTime() >= nearNowThreshold;
+}
+
+function computeLocalHistoryProgressPct(timeframe: OhlcvTimeframe, latestTimestampIso: string) {
+  const latestTs = new Date(latestTimestampIso).getTime();
+  if (Number.isNaN(latestTs)) {
+    return null;
+  }
+
+  const stepMs = timeframeSeconds[timeframe] * 1000;
+  const nowCeiling = Date.now() - stepMs;
+  const totalSpan = Math.max(1, nowCeiling - LOCAL_HISTORY_FLOOR.getTime());
+  const coveredSpan = Math.max(0, Math.min(latestTs, nowCeiling) - LOCAL_HISTORY_FLOOR.getTime());
+  const raw = (coveredSpan / totalSpan) * 100;
+
+  return Math.max(0, Math.min(99, Math.floor(raw)));
 }
 
 function prioritizeVisibleGaps(
@@ -888,7 +1024,7 @@ function fillMissingChartCandles(
 function toChartCandle(candle: MoralisCandle): ChartCandle {
   const timestamp = new Date(candle.timestamp);
 
-  return {
+  return normalizeChartCandle({
     time: Math.floor(timestamp.getTime() / 1000),
     timestamp: timestamp.toISOString(),
     open: candle.open,
@@ -897,7 +1033,33 @@ function toChartCandle(candle: MoralisCandle): ChartCandle {
     close: candle.close,
     volume: candle.volume ?? null,
     trades: candle.trades ?? null,
+  });
+}
+
+function normalizeChartCandle(candle: ChartCandle): ChartCandle {
+  const open = Number(candle.open);
+  const high = Number(candle.high);
+  const low = Number(candle.low);
+  const close = Number(candle.close);
+
+  if (![open, high, low, close].every(Number.isFinite)) {
+    return candle;
+  }
+
+  const rangeHigh = Math.max(high, low);
+  const rangeLow = Math.min(high, low);
+
+  return {
+    ...candle,
+    open: clamp(open, rangeLow, rangeHigh),
+    high: rangeHigh,
+    low: rangeLow,
+    close: clamp(close, rangeLow, rangeHigh),
   };
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
 }
 
 function createSyntheticCandlesFromCache(

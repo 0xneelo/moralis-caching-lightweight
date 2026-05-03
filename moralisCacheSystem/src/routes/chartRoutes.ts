@@ -17,6 +17,7 @@ const chartQuerySchema = z.object({
   to: z.string().datetime(),
   visibleFrom: z.string().datetime().optional(),
   visibleTo: z.string().datetime().optional(),
+  refreshFromMoralis: z.coerce.boolean().optional(),
   requestedTimeframe: z
     .custom<OhlcvTimeframe>((value) => typeof value === 'string' && isOhlcvTimeframe(value), {
       message: 'Unsupported requested timeframe',
@@ -34,9 +35,17 @@ export async function registerChartRoutes(app: FastifyInstance) {
 
     const currency = (parsed.data.currency ?? config.DEFAULT_CURRENCY) as OhlcvCurrency;
     const from = new Date(parsed.data.from);
-    const to = new Date(parsed.data.to);
-    const visibleFrom = parsed.data.visibleFrom ? new Date(parsed.data.visibleFrom) : from;
-    const visibleTo = parsed.data.visibleTo ? new Date(parsed.data.visibleTo) : to;
+    const now = new Date();
+    const to = new Date(Math.min(new Date(parsed.data.to).getTime(), now.getTime()));
+    const visibleFromCandidate = parsed.data.visibleFrom ? new Date(parsed.data.visibleFrom) : from;
+    const visibleFrom = new Date(Math.min(visibleFromCandidate.getTime(), to.getTime()));
+    const visibleTo = new Date(
+      Math.min(parsed.data.visibleTo ? new Date(parsed.data.visibleTo).getTime() : to.getTime(), to.getTime())
+    );
+
+    if (to <= from) {
+      throw badRequest('Invalid chart range');
+    }
     const requestedTimeframe = parsed.data.requestedTimeframe ?? parsed.data.timeframe;
     const interactionId = request.headers['x-interaction-id']?.toString();
     const effectiveTimeframe = getEffectiveAdaptiveTimeframe({
@@ -60,11 +69,20 @@ export async function registerChartRoutes(app: FastifyInstance) {
       maxProviderPages: 1,
       maxProviderFetches: 1,
       interactionId,
+      refreshFromMoralis: parsed.data.refreshFromMoralis ?? false,
     });
 
     reply.header('x-requested-timeframe', requestedTimeframe);
     reply.header('x-effective-timeframe', effectiveTimeframe);
     reply.header('x-cache-source', response.source);
+    reply.header('x-history-complete', String(response.historyComplete));
+    reply.header('x-history-warming', String(response.historyWarming));
+    if (response.historyProgressPct !== null) {
+      reply.header('x-history-progress-pct', String(response.historyProgressPct));
+    }
+    if (response.marketStart) {
+      reply.header('x-market-start', response.marketStart);
+    }
 
     return response;
   });
