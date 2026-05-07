@@ -4,35 +4,23 @@
     "type": "split",
     "children": [
       {
-        "id": "e953b8f260db7560",
+        "id": "3cc341d742e890d3",
         "type": "tabs",
         "children": [
           {
-            "id": "38c26c863f1612bc",
+            "id": "795aa2d19e16c550",
             "type": "leaf",
             "state": {
-              "type": "graph",
-              "state": {},
-              "icon": "lucide-git-fork",
-              "title": "Graph view"
-            }
-          },
-          {
-            "id": "4bf70c29595ded32",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
+              "type": "bases",
               "state": {
-                "file": "docs/obsidian/latencyAudit/00-index.md",
-                "mode": "source",
-                "source": false
+                "file": "Untitled.base",
+                "viewName": "Table"
               },
-              "icon": "lucide-file",
-              "title": "00-index"
+              "icon": "lucide-table",
+              "title": "Untitled"
             }
           }
-        ],
-        "currentTab": 1
+        ]
       }
     ],
     "direction": "vertical"
@@ -191,8 +179,10 @@
       "bases:Create new base": false
     }
   },
-  "active": "4bf70c29595ded32",
+  "active": "82a6e27b94533869",
   "lastOpenFiles": [
+    "docs/obsidian/latencyAudit/00-index.md",
+    "Untitled.base",
     "moralisCacheSystem/logs/interactions/2026-05-03T15-09-20-935Z_chart_range_click_click_mopwp4tg_mkx3akht.jsonl",
     "moralisCacheSystem/logs/interactions/2026-05-03T15-09-20-670Z_candle_resolution_click_click_mopwp4m2_74gb1nnx.jsonl",
     "moralisCacheSystem/logs/interactions/2026-05-03T15-09-20-323Z_chart_range_click_click_mopwp4cg_xob427ae.jsonl",
@@ -202,8 +192,6 @@
     "moralisCacheSystem/logs/interactions/2026-05-03T15-07-22-621Z_candle_resolution_click_click_mopwmliy_ivtq9wfz.jsonl",
     "moralisCacheSystem/logs/interactions/2026-05-03T15-07-21-867Z_candle_resolution_click_click_mopwmky0_bm76zdpj.jsonl",
     "moralisCacheSystem/logs/interactions/2026-05-03T15-07-21-048Z_candle_resolution_click_click_mopwmkb8_jdlb85ds.jsonl",
-    "moralisCacheSystem/logs/interactions/2026-05-03T15-07-19-952Z_chart_range_click_click_mopwmjgs_sfa1vqdu.jsonl",
-    "moralisCacheSystem/logs/interactions/2026-05-03T15-07-18-952Z_candle_resolution_click_click_mopwmip0_2gufdldk.jsonl",
     "docs/obsidian/latencyAudit/07-solana-candle-quality-fix.md",
     "docs/obsidian/latencyAudit/06-implemented-latency-fixes.md",
     "2026-05-03.md",
@@ -215,7 +203,6 @@
     "moralisCacheSystem/node_modules/wrappy/README.md",
     "docs/obsidian/latencyAudit/04-current-latency-findings.md",
     "docs/obsidian/latencyAudit/03-moralis-cache-flow.md",
-    "docs/obsidian/latencyAudit/00-index.md",
     "docs/obsidian/latencyAudit/02-backend-chart-route-flow.md",
     "docs/screenshots/photo_2026-05-03_15-37-46.jpg",
     "docs/screenshots/photo_2026-05-03_15-37-08.jpg",
