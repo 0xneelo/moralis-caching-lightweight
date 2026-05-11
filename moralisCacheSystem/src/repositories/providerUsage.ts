@@ -92,6 +92,7 @@ export const providerUsageRepository = {
         COALESCE(count(*), 0)::text AS total_requests
       FROM provider_api_usage
       WHERE provider = 'moralis'
+        AND endpoint = 'getPairCandlesticks'
       `,
       [startOfDay]
     );
@@ -106,5 +107,92 @@ export const providerUsageRepository = {
       since: startOfDay.toISOString(),
       updatedAt: now.toISOString(),
     };
+  },
+
+  async logThrottleEvent(params: {
+    provider: string;
+    reason: string;
+    chain?: string;
+    pairAddress?: string;
+    timeframe?: OhlcvTimeframe;
+    requestFrom?: Date;
+    requestTo?: Date;
+    detailMs?: number;
+  }) {
+    await query(
+      `
+      INSERT INTO provider_api_usage (
+        id,
+        provider,
+        endpoint,
+        chain,
+        pair_address,
+        timeframe,
+        request_from,
+        request_to,
+        http_status,
+        estimated_cu,
+        pages,
+        duration_ms
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      `,
+      [
+        crypto.randomUUID(),
+        params.provider,
+        `chartThrottle:${params.reason}`,
+        params.chain ?? null,
+        params.pairAddress ?? null,
+        params.timeframe ?? null,
+        params.requestFrom ?? null,
+        params.requestTo ?? null,
+        429,
+        0,
+        0,
+        params.detailMs ?? null,
+      ]
+    );
+  },
+
+  async getThrottleEvents(params?: { limit?: number | undefined }) {
+    const limit = Math.max(1, Math.min(1000, params?.limit ?? 200));
+    const result = await query<{
+      timestamp: Date;
+      endpoint: string;
+      chain: string | null;
+      pair_address: string | null;
+      timeframe: string | null;
+      request_from: Date | null;
+      request_to: Date | null;
+      detail_ms: number | null;
+    }>(
+      `
+      SELECT
+        created_at AS timestamp,
+        endpoint,
+        chain,
+        pair_address,
+        timeframe,
+        request_from,
+        request_to,
+        duration_ms AS detail_ms
+      FROM provider_api_usage
+      WHERE provider = 'moralis'
+        AND endpoint LIKE 'chartThrottle:%'
+      ORDER BY created_at DESC
+      LIMIT $1
+      `,
+      [limit]
+    );
+
+    return result.rows.map((row) => ({
+      timestamp: row.timestamp.toISOString(),
+      reason: row.endpoint.replace(/^chartThrottle:/, ''),
+      chain: row.chain,
+      pairAddress: row.pair_address,
+      timeframe: row.timeframe,
+      requestFrom: row.request_from?.toISOString() ?? null,
+      requestTo: row.request_to?.toISOString() ?? null,
+      detailMs: row.detail_ms,
+    }));
   },
 };

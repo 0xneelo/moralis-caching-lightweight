@@ -23,11 +23,12 @@ const MAX_MORALIS_COMPAT_LIMIT = 1000;
 const DEFAULT_MORALIS_COMPAT_LIMIT = 100;
 const LOCAL_MAX_PROVIDER_PAGES_PER_CHART_REQUEST = 1;
 const LOCAL_MAX_PROVIDER_GAPS_PER_CHART_REQUEST = 1;
-const LOCAL_PROVIDER_FETCH_COOLDOWN_MS = 60_000;
+const LOCAL_OBSERVABILITY_COOLDOWN_WINDOW_MS = 60_000;
 const LOCAL_HISTORY_FLOOR = new Date('2024-01-01T00:00:00.000Z');
 const LOCAL_EXTERNAL_API_KEY_FILE = '.local-external-api-key';
 const LOCAL_PROXY_USAGE_FILE = '.local-proxy-usage.json';
 const LOCAL_PROXY_USAGE_EVENTS_FILE = '.local-proxy-usage.jsonl';
+const LOCAL_THROTTLE_EVENTS_FILE = '.local-provider-throttle-events.jsonl';
 const candles = new Map<string, ChartCandle[]>();
 const responses = new Map<string, unknown>();
 const marketHistoryState = new Map<
@@ -76,6 +77,22 @@ type LocalProxyUsageEvent = {
   mode: 'local-memory';
 };
 
+type LocalThrottleEvent = {
+  timestamp: string;
+  reason:
+    | 'would_have_provider_cooldown'
+    | 'provider_fetch_already_active'
+    | 'max_provider_fetches_reached';
+  chain: string;
+  pairAddress: string;
+  timeframe: OhlcvTimeframe;
+  currency: OhlcvCurrency;
+  requestFrom: string;
+  requestTo: string;
+  detailMs: number | null;
+  mode: 'local-memory';
+};
+
 const usage = await loadLocalProxyUsage();
 
 const chartQuerySchema = z.object({
@@ -94,6 +111,10 @@ const chartQuerySchema = z.object({
       message: 'Unsupported requested timeframe',
     })
     .optional(),
+  refreshFromMoralis: z
+    .string()
+    .optional()
+    .transform((value) => value === 'true'),
 });
 
 const moralisCompatQuerySchema = z.object({
@@ -126,6 +147,18 @@ app.get('/health', async () => ({
 }));
 
 app.get('/api/usage/moralis', async () => usage);
+app.get('/api/usage/moralis/cooldown-skips', async (request) => {
+  const parsed = z
+    .object({
+      limit: z.coerce.number().int().positive().max(1000).optional(),
+    })
+    .safeParse(request.query);
+  const limit = parsed.success ? parsed.data.limit : undefined;
+
+  return {
+    events: await readLocalThrottleEvents(limit ?? 200),
+  };
+});
 
 app.post('/api/debug/interactions', async (request, reply) => {
   const parsed = z
@@ -176,6 +209,7 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
   const visibleTo = parsed.data.visibleTo ? new Date(parsed.data.visibleTo) : to;
   const requestedTimeframe = parsed.data.requestedTimeframe ?? parsed.data.timeframe;
   const interactionId = request.headers['x-interaction-id']?.toString();
+  const refreshFromMoralis = parsed.data.refreshFromMoralis;
   const effectiveTimeframe = getEffectiveAdaptiveTimeframe({
     requestedTimeframe,
     from: visibleFrom,
@@ -323,12 +357,16 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
     candleKey,
     cachedCandlesInWindow: matching.length,
   });
-  const gaps = findMissingRanges({
-    candles: matching.map((candle) => ({ timestamp: new Date(candle.timestamp) })),
-    timeframe: effectiveTimeframe,
-    from,
-    to,
-  });
+  const marketStartDate = parseIsoDateOrNull(historyState.marketStart);
+  const gaps = filterGapsFromMarketStart(
+    findMissingRanges({
+      candles: matching.map((candle) => ({ timestamp: new Date(candle.timestamp) })),
+      timeframe: effectiveTimeframe,
+      from,
+      to,
+    }),
+    marketStartDate
+  );
   const prioritizedGaps = prioritizeVisibleGaps(gaps, {
     from: visibleFrom,
     to: visibleTo,
@@ -340,7 +378,7 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
   let partial = gaps.length > 0;
   let marketStart = historyState.marketStart;
   let historyComplete = historyState.historyComplete;
-  let historyWarming = historyState.historyWarming || (fullHistoryRequested && !historyState.historyComplete);
+  let historyWarming = fullHistoryRequested && !historyState.historyComplete;
   let historyProgressPct = historyState.historyProgressPct;
 
   if (gaps.length > 0) {
@@ -383,6 +421,16 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
             },
             'Skipped additional local Moralis gap fetch to protect CU usage'
           );
+          await recordLocalThrottleEvent({
+            reason: 'max_provider_fetches_reached',
+            chain: parsed.data.chain,
+            pairAddress,
+            timeframe: effectiveTimeframe,
+            currency: parsed.data.currency,
+            requestFrom: gap.from,
+            requestTo: gap.to,
+            detailMs: null,
+          });
           partial = true;
           break;
         }
@@ -404,28 +452,61 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
             },
             'Skipped local Moralis fetch because another provider fetch is already active for this pair'
           );
+          await recordLocalThrottleEvent({
+            reason: 'provider_fetch_already_active',
+            chain: parsed.data.chain,
+            pairAddress,
+            timeframe: effectiveTimeframe,
+            currency: parsed.data.currency,
+            requestFrom: gap.from,
+            requestTo: gap.to,
+            detailMs: null,
+          });
           partial = true;
           break;
         }
 
-        const lastProviderFetchAt = providerFetchCooldowns.get(providerFetchKey) ?? 0;
-        const cooldownRemainingMs =
-          LOCAL_PROVIDER_FETCH_COOLDOWN_MS - (Date.now() - lastProviderFetchAt);
-
-        if (cooldownRemainingMs > 0) {
-          logger.warn(
+        if (refreshFromMoralis) {
+          logger.info(
             {
               pairAddress,
               requestedTimeframe,
               effectiveTimeframe,
-              cooldownRemainingMs,
               gapFrom: gap.from.toISOString(),
               gapTo: gap.to.toISOString(),
             },
-            'Skipped local Moralis fetch because provider fetch cooldown is active for this pair'
+            'refreshFromMoralis=true requested; bypassing observability cooldown marker'
           );
-          partial = true;
-          break;
+        }
+
+        if (!refreshFromMoralis) {
+          const lastProviderFetchAt = providerFetchCooldowns.get(providerFetchKey) ?? 0;
+          const cooldownRemainingMs =
+            LOCAL_OBSERVABILITY_COOLDOWN_WINDOW_MS - (Date.now() - lastProviderFetchAt);
+
+          if (cooldownRemainingMs > 0) {
+            logger.info(
+              {
+                pairAddress,
+                requestedTimeframe,
+                effectiveTimeframe,
+                cooldownRemainingMs,
+                gapFrom: gap.from.toISOString(),
+                gapTo: gap.to.toISOString(),
+              },
+              'Observed request within historical cooldown window; continuing fetch for fast UX'
+            );
+            await recordLocalThrottleEvent({
+              reason: 'would_have_provider_cooldown',
+              chain: parsed.data.chain,
+              pairAddress,
+              timeframe: effectiveTimeframe,
+              currency: parsed.data.currency,
+              requestFrom: gap.from,
+              requestTo: gap.to,
+              detailMs: cooldownRemainingMs,
+            });
+          }
         }
 
         try {
@@ -461,8 +542,12 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
               moralisCandleTimes.add(candle.time);
             }
             if (fetchedCandles.length > 0) {
-              const earliestFetched = fetchedCandles[0];
-              const latestFetched = fetchedCandles.at(-1);
+              const earliestFetched = fetchedCandles.reduce((earliest, candle) =>
+                !earliest || candle.time < earliest.time ? candle : earliest
+              , null as ChartCandle | null);
+              const latestFetched = fetchedCandles.reduce((latest, candle) =>
+                !latest || candle.time > latest.time ? candle : latest
+              , null as ChartCandle | null);
               if (earliestFetched) {
                 marketStart =
                   !marketStart || earliestFetched.timestamp < marketStart
@@ -474,14 +559,17 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
               }
             }
             stored = mergeCandles(stored, fetchedCandles);
-            const remainingGaps = findMissingRanges({
-              candles: filterCandles(stored, gap.from, gap.to).map((candle) => ({
-                timestamp: new Date(candle.timestamp),
-              })),
-              timeframe: effectiveTimeframe,
-              from: gap.from,
-              to: gap.to,
-            });
+            const remainingGaps = filterGapsFromMarketStart(
+              findMissingRanges({
+                candles: filterCandles(stored, gap.from, gap.to).map((candle) => ({
+                  timestamp: new Date(candle.timestamp),
+                })),
+                timeframe: effectiveTimeframe,
+                from: gap.from,
+                to: gap.to,
+              }),
+              parseIsoDateOrNull(marketStart)
+            );
 
             responseSource = 'cache+moralis';
             partial = remainingGaps.length > 0;
@@ -534,8 +622,65 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
     }
   }
 
+  let storedForResponse = candles.get(candleKey) ?? [];
+  let fillSeedCandle = findFillSeedCandle({
+    chain: parsed.data.chain,
+    pairAddress,
+    timeframe: effectiveTimeframe,
+    currency: parsed.data.currency,
+    from,
+    sameTimeframeCandles: storedForResponse,
+  });
+
+  if (!fillSeedCandle && config.MORALIS_API_KEY && filterCandles(storedForResponse, from, to).length === 0) {
+    const seedFrom = getFillSeedLookbackFrom(from, effectiveTimeframe);
+
+    try {
+      const seedResult = await fetchMoralisOhlcvLocal({
+        chain: parsed.data.chain,
+        pairAddress,
+        timeframe: effectiveTimeframe,
+        currency: parsed.data.currency,
+        from: seedFrom,
+        to: from,
+        maxPages: 1,
+        interactionId,
+      });
+      const seedCandles = seedResult.candles.map(toChartCandle);
+
+      if (seedCandles.length > 0) {
+        storedForResponse = mergeCandles(storedForResponse, seedCandles);
+        candles.set(candleKey, storedForResponse);
+        fillSeedCandle = findLatestCandleBefore(storedForResponse, Math.floor(from.getTime() / 1000));
+        responseSource = responseSource === 'partial' ? 'cache+moralis' : responseSource;
+        await recordMoralisUsage({
+          chain: parsed.data.chain,
+          pairAddress,
+          timeframe: effectiveTimeframe,
+          currency: parsed.data.currency,
+          requestFrom: seedFrom,
+          requestTo: from,
+          pages: seedResult.pages,
+          returnedCandles: seedResult.candles.length,
+        });
+      }
+    } catch (error) {
+      logger.warn(
+        {
+          error,
+          pairAddress,
+          requestedTimeframe,
+          effectiveTimeframe,
+          seedFrom: seedFrom.toISOString(),
+          seedTo: from.toISOString(),
+        },
+        'Unable to fetch prior seed candle for filler candles.'
+      );
+    }
+  }
+
   const finalCandles = fillMissingChartCandles(
-    filterCandles(candles.get(candleKey) ?? [], from, to).map((candle) => ({
+    filterCandles(storedForResponse, from, to).map((candle) => ({
       ...candle,
       source: generatedDemoCandles
         ? 'demo'
@@ -545,7 +690,8 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
     })),
     from,
     to,
-    effectiveTimeframe
+    effectiveTimeframe,
+    fillSeedCandle
   );
   const response = {
     chain: parsed.data.chain,
@@ -575,10 +721,13 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
     response.historyWarming = historyWarming;
     response.historyProgressPct = historyProgressPct;
     response.marketStart = marketStart;
-  } else if (!historyComplete && gaps.length > 0) {
+  } else if (fullHistoryRequested && !historyComplete && gaps.length > 0) {
     historyWarming = true;
     response.historyWarming = true;
     response.historyProgressPct = historyProgressPct ?? 0;
+  } else {
+    historyWarming = false;
+    response.historyWarming = false;
   }
 
   marketHistoryState.set(historyKey, {
@@ -920,6 +1069,31 @@ function distanceToRange(range: { from: Date; to: Date }, target: { from: Date; 
   return range.from.getTime() - target.to.getTime();
 }
 
+function parseIsoDateOrNull(value: string | null) {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function filterGapsFromMarketStart(
+  gaps: Array<{ from: Date; to: Date }>,
+  marketStart: Date | null
+) {
+  if (!marketStart) {
+    return gaps;
+  }
+
+  return gaps
+    .map((gap) => ({
+      from: gap.from.getTime() < marketStart.getTime() ? marketStart : gap.from,
+      to: gap.to,
+    }))
+    .filter((gap) => gap.to.getTime() > gap.from.getTime());
+}
+
 function markCachedResponseCandles(response: unknown) {
   if (
     typeof response !== 'object' ||
@@ -985,14 +1159,15 @@ function fillMissingChartCandles(
   inputCandles: ChartCandle[],
   from: Date,
   to: Date,
-  timeframe: OhlcvTimeframe
+  timeframe: OhlcvTimeframe,
+  seedCandle?: ChartCandle | undefined
 ) {
   const candlesByTime = new Map(inputCandles.map((candle) => [candle.time, candle]));
   const stepSeconds = timeframeSeconds[timeframe];
   const fromSeconds = Math.floor(alignToCandleStart(from, timeframe).getTime() / 1000);
   const toSeconds = Math.floor(Math.min(to.getTime(), Date.now()) / 1000);
   const result: ChartCandle[] = [];
-  let previousReal: ChartCandle | undefined;
+  let previousReal: ChartCandle | undefined = seedCandle;
 
   for (let time = fromSeconds; time < toSeconds; time += stepSeconds) {
     const candle = candlesByTime.get(time);
@@ -1019,6 +1194,68 @@ function fillMissingChartCandles(
   }
 
   return result;
+}
+
+function findFillSeedCandle(params: {
+  chain: string;
+  pairAddress: string;
+  timeframe: OhlcvTimeframe;
+  currency: OhlcvCurrency;
+  from: Date;
+  sameTimeframeCandles: ChartCandle[];
+}) {
+  const fromSeconds = Math.floor(params.from.getTime() / 1000);
+  const sameTimeframeSeed = findLatestCandleBefore(params.sameTimeframeCandles, fromSeconds);
+
+  if (sameTimeframeSeed) {
+    return sameTimeframeSeed;
+  }
+
+  const compatibleSeeds: ChartCandle[] = [];
+
+  for (const timeframe of Object.keys(timeframeSeconds)) {
+    if (!isOhlcvTimeframe(timeframe)) {
+      continue;
+    }
+
+    const candleKey = buildCandleKey({
+      chain: params.chain,
+      pairAddress: params.pairAddress,
+      timeframe,
+      currency: params.currency,
+    });
+    const seed = findLatestCandleBefore(candles.get(candleKey) ?? [], fromSeconds);
+
+    if (seed) {
+      compatibleSeeds.push(seed);
+    }
+  }
+
+  return compatibleSeeds.sort((left, right) => right.time - left.time)[0];
+}
+
+function findLatestCandleBefore(allCandles: ChartCandle[], beforeSeconds: number) {
+  return allCandles
+    .filter((candle) => candle.source !== 'filled' && candle.time < beforeSeconds)
+    .sort((left, right) => right.time - left.time)[0];
+}
+
+function getFillSeedLookbackFrom(from: Date, timeframe: OhlcvTimeframe) {
+  const stepMs = timeframeSeconds[timeframe] * 1000;
+  const lookbackByTimeframe: Partial<Record<OhlcvTimeframe, number>> = {
+    '1min': 24 * 60 * 60 * 1000,
+    '5min': 3 * 24 * 60 * 60 * 1000,
+    '10min': 7 * 24 * 60 * 60 * 1000,
+    '30min': 14 * 24 * 60 * 60 * 1000,
+    '1h': 30 * 24 * 60 * 60 * 1000,
+    '4h': 90 * 24 * 60 * 60 * 1000,
+    '6h': 90 * 24 * 60 * 60 * 1000,
+    '12h': 180 * 24 * 60 * 60 * 1000,
+    '1d': 365 * 24 * 60 * 60 * 1000,
+  };
+  const lookbackMs = Math.max(stepMs, lookbackByTimeframe[timeframe] ?? 30 * stepMs);
+
+  return new Date(Math.max(LOCAL_HISTORY_FLOOR.getTime(), from.getTime() - lookbackMs));
 }
 
 function toChartCandle(candle: MoralisCandle): ChartCandle {
@@ -1517,6 +1754,76 @@ function resetLoadedUsageDayIfNeeded(target: LocalProxyUsage) {
 async function persistLocalProxyUsage(event: LocalProxyUsageEvent) {
   await fs.appendFile(LOCAL_PROXY_USAGE_EVENTS_FILE, `${JSON.stringify(event)}\n`, 'utf8');
   await writeLocalProxyUsageSummary(usage);
+}
+
+async function recordLocalThrottleEvent(params: {
+  reason: LocalThrottleEvent['reason'];
+  chain: string;
+  pairAddress: string;
+  timeframe: OhlcvTimeframe;
+  currency: OhlcvCurrency;
+  requestFrom: Date;
+  requestTo: Date;
+  detailMs: number | null;
+}) {
+  const event: LocalThrottleEvent = {
+    timestamp: new Date().toISOString(),
+    reason: params.reason,
+    chain: params.chain,
+    pairAddress: params.pairAddress,
+    timeframe: params.timeframe,
+    currency: params.currency,
+    requestFrom: params.requestFrom.toISOString(),
+    requestTo: params.requestTo.toISOString(),
+    detailMs: params.detailMs,
+    mode: 'local-memory',
+  };
+
+  try {
+    await fs.appendFile(LOCAL_THROTTLE_EVENTS_FILE, `${JSON.stringify(event)}\n`, 'utf8');
+  } catch (error) {
+    logger.warn(
+      {
+        error,
+        file: LOCAL_THROTTLE_EVENTS_FILE,
+        reason: event.reason,
+      },
+      'Failed to persist local throttle event.'
+    );
+  }
+}
+
+async function readLocalThrottleEvents(limit: number) {
+  try {
+    const raw = await fs.readFile(LOCAL_THROTTLE_EVENTS_FILE, 'utf8');
+    const rows = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line) as LocalThrottleEvent;
+        } catch {
+          return null;
+        }
+      })
+      .filter((event): event is LocalThrottleEvent => event !== null);
+
+    return rows.slice(-limit).reverse();
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      return [];
+    }
+
+    logger.warn(
+      {
+        error,
+        file: LOCAL_THROTTLE_EVENTS_FILE,
+      },
+      'Failed to read local throttle events.'
+    );
+    return [];
+  }
 }
 
 async function writeLocalProxyUsageSummary(summary: LocalProxyUsage) {

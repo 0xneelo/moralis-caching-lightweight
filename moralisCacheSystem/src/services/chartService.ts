@@ -325,6 +325,15 @@ export async function getOhlcvForChart(params: {
           partial = true;
           sourceOverride = 'partial';
           providerFetches = maxProviderFetches;
+          await providerUsageRepository.logThrottleEvent({
+            provider: 'moralis',
+            reason: 'provider_miss_rate_limited',
+            chain: params.chain,
+            pairAddress,
+            timeframe: params.timeframe,
+            requestFrom: params.from,
+            requestTo: params.to,
+          });
           await appendInteractionTraceEvent(params.interactionId, 'provider_fetch_rate_limited_cache_only', {
             route: '/api/charts/ohlcv',
             chain: params.chain,
@@ -346,6 +355,15 @@ export async function getOhlcvForChart(params: {
     for (const gap of prioritizedGaps) {
       if (providerFetches >= maxProviderFetches) {
         partial = true;
+        await providerUsageRepository.logThrottleEvent({
+          provider: 'moralis',
+          reason: 'max_provider_fetches_reached',
+          chain: params.chain,
+          pairAddress,
+          timeframe: params.timeframe,
+          requestFrom: gap.from,
+          requestTo: gap.to,
+        });
         continue;
       }
 
@@ -364,6 +382,16 @@ export async function getOhlcvForChart(params: {
         });
 
         partial = true;
+        await providerUsageRepository.logThrottleEvent({
+          provider: 'moralis',
+          reason: 'gap_enqueued_too_large_for_sync',
+          chain: params.chain,
+          pairAddress,
+          timeframe: params.timeframe,
+          requestFrom: gap.from,
+          requestTo: gap.to,
+          detailMs: estimatedGapCandles,
+        });
         continue;
       }
 

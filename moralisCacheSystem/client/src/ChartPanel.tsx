@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef } from 'react';
 import {
   CandlestickSeries,
+  type CandlestickData,
   HistogramSeries,
+  type HistogramData,
   PriceScaleMode,
   createChart,
   type IChartApi,
@@ -9,6 +11,7 @@ import {
   type ISeriesApi,
   type Time,
   type UTCTimestamp,
+  type WhitespaceData,
 } from 'lightweight-charts';
 import type { ChartCandle, TimeWindow, Timeframe } from './api';
 
@@ -21,12 +24,33 @@ type ChartPanelProps = {
   historyWarmup: boolean;
   historyProgressPct: number | null;
   debugColors: boolean;
+  showFilledCandles: boolean;
+  dexscreenerMode: boolean;
+  scrollModeEnabled: boolean;
+  syntheticMode: boolean;
   /** Effective series resolution (must match candle bucket size for correct x-axis). */
   effectiveTimeframe: Timeframe;
   visibleRange: TimeWindow;
+  visibleCandleCount: number;
   visibleRangeRevision: number;
   onVisibleRangeChange: (range: TimeWindow) => void;
+  onVisibleLogicalRangeChange: (range: VisibleLogicalRange) => void;
 };
+
+type VisibleLogicalRange = {
+  from: number;
+  to: number;
+  totalBars: number;
+  firstTime: number | null;
+  lastTime: number | null;
+};
+
+type RenderCandle = Omit<ChartCandle, 'source'> & {
+  source?: ChartCandle['source'] | 'synthetic';
+};
+
+const DEXSCREENER_FLAT_RANGE_PCT = 0.0005;
+const DEXSCREENER_FLAT_BODY_PCT = 0.00025;
 
 export function ChartPanel({
   candles,
@@ -37,54 +61,111 @@ export function ChartPanel({
   historyWarmup,
   historyProgressPct,
   debugColors,
+  showFilledCandles,
+  dexscreenerMode,
+  scrollModeEnabled,
+  syntheticMode,
   effectiveTimeframe,
   visibleRange,
+  visibleCandleCount,
   visibleRangeRevision,
   onVisibleRangeChange,
+  onVisibleLogicalRangeChange,
 }: ChartPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const onVisibleRangeChangeRef = useRef(onVisibleRangeChange);
+  const onVisibleLogicalRangeChangeRef = useRef(onVisibleLogicalRangeChange);
+  const timeScaleCandlesRef = useRef<RenderCandle[]>([]);
   const visibleRangeRef = useRef(visibleRange);
   const suppressVisibleRangeEventRef = useRef(false);
+  const lastAppliedVisibleRangeRevisionRef = useRef<number | null>(null);
+  const lastAppliedTimeframeRef = useRef<Timeframe | null>(null);
+  const lastAppliedDexscreenerModeRef = useRef<boolean | null>(null);
+  const lastAppliedVisibleCandleCountRef = useRef<number | null>(null);
+  const timeScaleCandles = useMemo(() => {
+    const byChartTime = new Map<string, RenderCandle>();
 
-  const chartData = useMemo(
+    for (const candle of candles) {
+      if ((dexscreenerMode || syntheticMode) && candle.source === 'filled') {
+        continue;
+      }
+
+      const chartTime = candleSecondsToChartTime(candle.time, effectiveTimeframe);
+      const chartTimeKey = getChartTimeKey(chartTime);
+      const existing = byChartTime.get(chartTimeKey);
+      if (existing && existing.source !== 'filled' && candle.source === 'filled') {
+        continue;
+      }
+
+      byChartTime.set(chartTimeKey, candle);
+    }
+
+    let sortedCandles = [...byChartTime.values()].sort((left, right) => left.time - right.time);
+
+    if (dexscreenerMode) {
+      sortedCandles = mergeDexscreenerFlatRuns(sortedCandles);
+    }
+
+    return syntheticMode ? insertSyntheticGapCandles(sortedCandles) : sortedCandles;
+  }, [candles, dexscreenerMode, effectiveTimeframe, syntheticMode]);
+
+  const chartData = useMemo<Array<CandlestickData<Time> | WhitespaceData<Time>>>(
     () =>
-      candles
-        .filter((candle) => candle.source !== 'filled')
-        .map((candle) => {
-          const normalized = normalizeOhlc(candle);
-          const time = candleSecondsToChartTime(normalized.time, effectiveTimeframe);
+      timeScaleCandles.map((candle) => {
+        const time = candleSecondsToChartTime(candle.time, effectiveTimeframe);
 
-          return {
-            time,
-            open: normalized.open,
-            high: normalized.high,
-            low: normalized.low,
-            close: normalized.close,
-            ...getCandleColors(normalized, debugColors),
-          };
-        }),
-    [candles, debugColors, effectiveTimeframe]
+        if (!showFilledCandles && candle.source === 'filled') {
+          return { time };
+        }
+
+        const normalized = normalizeOhlc(candle);
+
+        return {
+          time,
+          open: normalized.open,
+          high: normalized.high,
+          low: normalized.low,
+          close: normalized.close,
+          ...getCandleColors(normalized, debugColors),
+        };
+      }),
+    [timeScaleCandles, debugColors, effectiveTimeframe, showFilledCandles]
   );
 
-  const volumeData = useMemo(
+  const volumeData = useMemo<Array<HistogramData<Time> | WhitespaceData<Time>>>(
     () =>
-      candles
-        .filter((candle) => candle.source !== 'filled')
-        .map((candle) => ({
-          time: candleSecondsToChartTime(candle.time, effectiveTimeframe),
+      timeScaleCandles.map((candle) => {
+        const time = candleSecondsToChartTime(candle.time, effectiveTimeframe);
+
+        if (!showFilledCandles && candle.source === 'filled') {
+          return { time };
+        }
+
+        return {
+          time,
           value: candle.volume ?? 0,
           color: getVolumeColor(candle, debugColors),
-        })),
-    [candles, debugColors, effectiveTimeframe]
+        };
+      }),
+    [timeScaleCandles, debugColors, effectiveTimeframe, showFilledCandles]
   );
+
+  const visibleOhlcData = useMemo(() => chartData.filter(isCandlestickData), [chartData]);
 
   useEffect(() => {
     onVisibleRangeChangeRef.current = onVisibleRangeChange;
   }, [onVisibleRangeChange]);
+
+  useEffect(() => {
+    onVisibleLogicalRangeChangeRef.current = onVisibleLogicalRangeChange;
+  }, [onVisibleLogicalRangeChange]);
+
+  useEffect(() => {
+    timeScaleCandlesRef.current = timeScaleCandles;
+  }, [timeScaleCandles]);
 
   useEffect(() => {
     visibleRangeRef.current = visibleRange;
@@ -115,6 +196,8 @@ export function ChartPanel({
         timeVisible: true,
         secondsVisible: false,
       },
+      handleScroll: getChartScrollOptions(scrollModeEnabled),
+      handleScale: getChartScaleOptions(scrollModeEnabled),
       crosshair: {
         vertLine: { color: 'rgba(182, 189, 255, 0.36)' },
         horzLine: { color: 'rgba(182, 189, 255, 0.36)' },
@@ -162,16 +245,41 @@ export function ChartPanel({
       }
     };
 
+    const handleVisibleLogicalRangeChange = (range: { from: number; to: number } | null) => {
+      if (!range || suppressVisibleRangeEventRef.current) {
+        return;
+      }
+
+      const currentCandles = timeScaleCandlesRef.current;
+
+      onVisibleLogicalRangeChangeRef.current({
+        from: range.from,
+        to: range.to,
+        totalBars: currentCandles.length,
+        firstTime: currentCandles[0]?.time ?? null,
+        lastTime: currentCandles[currentCandles.length - 1]?.time ?? null,
+      });
+    };
+
     chart.timeScale().subscribeVisibleTimeRangeChange(handleVisibleRangeChange);
+    chart.timeScale().subscribeVisibleLogicalRangeChange(handleVisibleLogicalRangeChange);
 
     return () => {
       chart.timeScale().unsubscribeVisibleTimeRangeChange(handleVisibleRangeChange);
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(handleVisibleLogicalRangeChange);
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
     };
   }, [effectiveTimeframe]);
+
+  useEffect(() => {
+    chartRef.current?.applyOptions({
+      handleScroll: getChartScrollOptions(scrollModeEnabled),
+      handleScale: getChartScaleOptions(scrollModeEnabled),
+    });
+  }, [scrollModeEnabled]);
 
   useEffect(() => {
     suppressVisibleRangeEventRef.current = true;
@@ -181,10 +289,10 @@ export function ChartPanel({
     candleSeriesRef.current?.setData(chartData);
     volumeSeriesRef.current?.setData(volumeData);
 
-    if (chartData.length > 0) {
+    if (visibleOhlcData.length > 0) {
       candleSeriesRef.current?.priceScale().setAutoScale(true);
       candleSeriesRef.current?.priceScale().applyOptions({
-        mode: computePriceScaleMode(chartData),
+        mode: computePriceScaleMode(visibleOhlcData),
         // No bottom padding — avoids sub-$1 charts painting ticks below zero.
         scaleMargins: { top: 0.12, bottom: 0 },
       });
@@ -193,28 +301,82 @@ export function ChartPanel({
     window.setTimeout(() => {
       suppressVisibleRangeEventRef.current = false;
     }, 500);
-  }, [candles, chartData, volumeData]);
+  }, [candles, chartData, volumeData, visibleOhlcData]);
 
   useEffect(() => {
     if (chartData.length === 0) {
       return;
     }
 
+    if (
+      lastAppliedVisibleRangeRevisionRef.current === visibleRangeRevision &&
+      lastAppliedTimeframeRef.current === effectiveTimeframe &&
+      lastAppliedDexscreenerModeRef.current === dexscreenerMode &&
+      lastAppliedVisibleCandleCountRef.current === visibleCandleCount
+    ) {
+      return;
+    }
+
+    lastAppliedVisibleRangeRevisionRef.current = visibleRangeRevision;
+    lastAppliedTimeframeRef.current = effectiveTimeframe;
+    lastAppliedDexscreenerModeRef.current = dexscreenerMode;
+    lastAppliedVisibleCandleCountRef.current = visibleCandleCount;
     suppressVisibleRangeEventRef.current = true;
+
+    if (dexscreenerMode) {
+      const lastIndex = chartData.length - 1;
+      const from = Math.max(0, lastIndex - visibleCandleCount + 1);
+
+      try {
+        chartRef.current?.timeScale().setVisibleLogicalRange({
+          from,
+          to: lastIndex,
+        });
+      } catch {
+        chartRef.current?.timeScale().fitContent();
+      }
+
+      window.setTimeout(() => {
+        suppressVisibleRangeEventRef.current = false;
+      }, 500);
+      return;
+    }
+
     const range = visibleRangeRef.current;
-    chartRef.current?.timeScale().setVisibleRange({
-      from: windowDateToChartTime(range.from, effectiveTimeframe),
-      to: windowDateToChartTime(range.to, effectiveTimeframe),
-    });
+    const firstDataDate = chartTimeToDate(chartData[0]!.time);
+    const lastDataDate = chartTimeToDate(chartData[chartData.length - 1]!.time);
+
+    if (!firstDataDate || !lastDataDate) {
+      suppressVisibleRangeEventRef.current = false;
+      return;
+    }
+
+    const clampedFrom = new Date(Math.max(range.from.getTime(), firstDataDate.getTime()));
+    const clampedTo = new Date(Math.min(range.to.getTime(), lastDataDate.getTime()));
+
+    try {
+      if (clampedTo <= clampedFrom) {
+        chartRef.current?.timeScale().fitContent();
+      } else {
+        chartRef.current?.timeScale().setVisibleRange({
+          from: windowDateToChartTime(clampedFrom, effectiveTimeframe),
+          to: windowDateToChartTime(clampedTo, effectiveTimeframe),
+        });
+      }
+    } catch {
+      // lightweight-charts can throw when a range maps to null logical indexes.
+      // Falling back to fitContent keeps the chart usable instead of crashing.
+      chartRef.current?.timeScale().fitContent();
+    }
     window.setTimeout(() => {
       suppressVisibleRangeEventRef.current = false;
     }, 500);
-  }, [chartData.length, visibleRangeRevision, effectiveTimeframe]);
+  }, [chartData.length, dexscreenerMode, visibleCandleCount, visibleRangeRevision, effectiveTimeframe]);
 
   return (
     <div className="chart-shell">
       <div ref={containerRef} className="chart-canvas" />
-      {historyWarmup ? (
+      {historyWarmup && candles.length === 0 ? (
         <div className="chart-empty chart-warmup">
           <div className="chart-warmup-spinner" aria-hidden="true" />
           <span>
@@ -300,7 +462,15 @@ function chartTimeToDate(value: Time): Date | null {
   return null;
 }
 
-function getCandleColors(candle: ChartCandle, debugColors: boolean) {
+function getChartTimeKey(value: Time) {
+  if (typeof value === 'number' || typeof value === 'string') {
+    return String(value);
+  }
+
+  return `${value.year}-${value.month}-${value.day}`;
+}
+
+function getCandleColors(candle: RenderCandle, debugColors: boolean) {
   const bullish = candle.close >= candle.open;
 
   if (!debugColors) {
@@ -335,6 +505,14 @@ function getCandleColors(candle: ChartCandle, debugColors: boolean) {
     };
   }
 
+  if (candle.source === 'synthetic') {
+    const color = '#22d3ee';
+    return {
+      color,
+      wickColor: color,
+    };
+  }
+
   const color = bullish ? '#46b297' : '#dc5b7f';
   return {
     color,
@@ -342,7 +520,7 @@ function getCandleColors(candle: ChartCandle, debugColors: boolean) {
   };
 }
 
-function normalizeOhlc(candle: ChartCandle): ChartCandle {
+function normalizeOhlc(candle: RenderCandle): RenderCandle {
   const open = Number(candle.open);
   const high = Number(candle.high);
   const low = Number(candle.low);
@@ -364,11 +542,156 @@ function normalizeOhlc(candle: ChartCandle): ChartCandle {
   };
 }
 
+function mergeDexscreenerFlatRuns(candles: RenderCandle[]) {
+  const mergedCandles: RenderCandle[] = [];
+  let flatRun: RenderCandle[] = [];
+
+  const flushFlatRun = () => {
+    if (flatRun.length === 0) {
+      return;
+    }
+
+    mergedCandles.push(flatRun.length === 1 ? flatRun[0]! : mergeCandleRun(flatRun));
+    flatRun = [];
+  };
+
+  for (const candle of candles) {
+    if (isDexscreenerFlatCandle(candle)) {
+      flatRun.push(candle);
+      continue;
+    }
+
+    flushFlatRun();
+    mergedCandles.push(candle);
+  }
+
+  flushFlatRun();
+
+  return mergedCandles;
+}
+
+function isDexscreenerFlatCandle(candle: RenderCandle) {
+  const normalized = normalizeOhlc(candle);
+  const values = [normalized.open, normalized.high, normalized.low, normalized.close];
+
+  if (!values.every(Number.isFinite)) {
+    return false;
+  }
+
+  const priceBase = Math.max(...values.map((value) => Math.abs(value)), Number.EPSILON);
+  const rangePct = Math.abs(normalized.high - normalized.low) / priceBase;
+  const bodyPct = Math.abs(normalized.close - normalized.open) / priceBase;
+
+  return rangePct <= DEXSCREENER_FLAT_RANGE_PCT && bodyPct <= DEXSCREENER_FLAT_BODY_PCT;
+}
+
+function mergeCandleRun(candles: RenderCandle[]): RenderCandle {
+  const normalizedCandles = candles.map(normalizeOhlc);
+  const first = normalizedCandles[0]!;
+  const last = normalizedCandles[normalizedCandles.length - 1]!;
+  const volumes = normalizedCandles
+    .map((candle) => candle.volume)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  const trades = normalizedCandles
+    .map((candle) => candle.trades)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  const source = normalizedCandles.find((candle) => candle.source && candle.source !== 'filled')?.source ?? first.source;
+
+  const merged: RenderCandle = {
+    ...first,
+    open: first.open,
+    high: Math.max(...normalizedCandles.map((candle) => candle.high)),
+    low: Math.min(...normalizedCandles.map((candle) => candle.low)),
+    close: last.close,
+    volume: volumes.length > 0 ? volumes.reduce((sum, value) => sum + value, 0) : null,
+    trades: trades.length > 0 ? trades.reduce((sum, value) => sum + value, 0) : null,
+  };
+
+  if (source) {
+    merged.source = source;
+  }
+
+  return merged;
+}
+
+function insertSyntheticGapCandles(candles: RenderCandle[]) {
+  if (candles.length < 2) {
+    return candles;
+  }
+
+  const nextCandles: RenderCandle[] = [];
+
+  for (let index = 0; index < candles.length; index += 1) {
+    const current = candles[index]!;
+    const next = candles[index + 1];
+    nextCandles.push(current);
+
+    if (!next) {
+      continue;
+    }
+
+    const synthetic = getSyntheticGapCandle(current, next);
+    if (synthetic) {
+      nextCandles.push(synthetic);
+    }
+  }
+
+  return nextCandles;
+}
+
+function getSyntheticGapCandle(previousCandle: RenderCandle, nextCandle: RenderCandle): RenderCandle | null {
+  const previous = normalizeOhlc(previousCandle);
+  const next = normalizeOhlc(nextCandle);
+  const gap = next.open - previous.close;
+
+  if (!Number.isFinite(gap) || Math.abs(gap) <= Number.EPSILON) {
+    return null;
+  }
+
+  const syntheticTime = Math.floor((previous.time + next.time) / 2);
+
+  if (syntheticTime <= previous.time || syntheticTime >= next.time) {
+    return null;
+  }
+
+  const high = Math.max(previous.close, next.open);
+  const low = Math.min(previous.close, next.open);
+
+  return {
+    time: syntheticTime,
+    timestamp: new Date(syntheticTime * 1000).toISOString(),
+    open: previous.close,
+    high,
+    low,
+    close: next.open,
+    volume: null,
+    trades: null,
+    source: 'synthetic',
+  };
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
-function getVolumeColor(candle: ChartCandle, debugColors: boolean) {
+function getChartScrollOptions(enabled: boolean) {
+  return {
+    mouseWheel: enabled,
+    pressedMouseMove: enabled,
+    horzTouchDrag: enabled,
+    vertTouchDrag: false,
+  };
+}
+
+function getChartScaleOptions(enabled: boolean) {
+  return {
+    axisPressedMouseMove: enabled,
+    mouseWheel: enabled,
+    pinch: enabled,
+  };
+}
+
+function getVolumeColor(candle: RenderCandle, debugColors: boolean) {
   const bullish = candle.close >= candle.open;
 
   if (!debugColors) {
@@ -385,6 +708,10 @@ function getVolumeColor(candle: ChartCandle, debugColors: boolean) {
 
   if (candle.source === 'filled') {
     return 'rgba(100, 116, 139, 0.18)';
+  }
+
+  if (candle.source === 'synthetic') {
+    return 'rgba(34, 211, 238, 0.18)';
   }
 
   return bullish ? 'rgba(70, 178, 151, 0.42)' : 'rgba(220, 91, 127, 0.42)';
@@ -410,6 +737,10 @@ function getPrecisionForPrice(price: number) {
   if (price < 1) return 6;
   if (price < 100) return 4;
   return 2;
+}
+
+function isCandlestickData(data: CandlestickData<Time> | WhitespaceData<Time>): data is CandlestickData<Time> {
+  return 'open' in data && 'high' in data && 'low' in data && 'close' in data;
 }
 
 /** Wide positive-only spans compress spikes like Dexscreener’s default log chart for microcaps. */

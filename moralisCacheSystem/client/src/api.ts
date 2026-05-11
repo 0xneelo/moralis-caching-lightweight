@@ -123,6 +123,10 @@ const maxRequestCandlesByTimeframe: Record<Timeframe, number> = {
 const MAX_CHART_REQUEST_CHUNKS = 5;
 const adaptiveTimeframeOrder: Timeframe[] = ['1min', '5min', '10min', '30min', '1h', '4h', '6h', '12h', '1d'];
 
+export function getTimeframeDurationMs(timeframe: Timeframe) {
+  return timeframeSeconds[timeframe] * 1000;
+}
+
 export async function fetchChartCandles(params: ChartRequest) {
   const effectiveTimeframe =
     params.effectiveTimeframe ??
@@ -450,9 +454,10 @@ function getMinimumTimeframeForWindow(range: TimeWindow): Timeframe {
   if (spanMs <= dayMs) return '1min';
   if (spanMs <= 7 * dayMs) return '5min';
   if (spanMs <= 30 * dayMs) return '30min';
-  if (spanMs <= 90 * dayMs) return '1h';
-  if (spanMs <= 365 * dayMs) return '4h';
-  return '12h';
+  if (spanMs <= 60 * dayMs) return '1h';
+  if (spanMs <= 90 * dayMs) return '4h';
+  if (spanMs <= 120 * dayMs) return '12h';
+  return '1d';
 }
 
 export function getMinimumTimeframeForRange(range: ChartRange): Timeframe {
@@ -470,8 +475,8 @@ export function getMinimumTimeframeForRange(range: ChartRange): Timeframe {
     '2M': '1h',
     '3M': '1h',
     '6M': '4h',
-    '1Y': '4h',
-    ALL: '12h',
+    '1Y': '12h',
+    ALL: '1d',
   };
 
   return minimumByRange[range];
