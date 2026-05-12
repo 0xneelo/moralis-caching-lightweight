@@ -1,11 +1,15 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { getAdminSettings, updateAdminSettings, type AdminSettingsPatch } from '../adminConfig.js';
+import { cacheSnapshotSchema, countSnapshotCandles } from '../cacheSnapshot.js';
 import { config } from '../config.js';
 import { badRequest, unauthorized } from '../httpErrors.js';
 import { enqueueBackfillJob } from '../jobs/enqueue.js';
 import { normalizePairAddress } from '../pairAddress.js';
 import { redis } from '../redis.js';
+import { candleRepository } from '../repositories/candles.js';
 import { externalApiKeyRepository } from '../repositories/externalApiKeys.js';
+import { providerUsageRepository } from '../repositories/providerUsage.js';
 import { isOhlcvTimeframe } from '../timeframes.js';
 import type { OhlcvTimeframe } from '../types.js';
 
@@ -30,7 +34,129 @@ const createApiKeyBodySchema = z.object({
   scopes: z.array(z.enum(['ohlcv:read'])).min(1).optional(),
 });
 
+const settingsPatchSchema = z.object({
+  moralisOhlcvEnabled: z.boolean().optional(),
+  moralisDailyCuBudget: z.number().int().positive().optional(),
+  maxSyncMoralisPages: z.number().int().positive().optional(),
+  maxSyncGapCandles: z.number().int().positive().optional(),
+  externalApiKeyRequestRateLimit: z.number().int().positive().optional(),
+  externalApiKeyCacheMissRateLimit: z.number().int().positive().optional(),
+  externalApiKeyDailyCuBudget: z.number().int().positive().optional(),
+});
+
 export async function registerAdminRoutes(app: FastifyInstance) {
+  app.get('/api/admin/session', async (request) => {
+    assertAdmin(request);
+
+    return {
+      ok: true,
+      settings: await getAdminSettings(),
+    };
+  });
+
+  app.get('/api/admin/dashboard', async (request) => {
+    assertAdmin(request);
+
+    const [usage, breakdown, apiKeys, cacheInventory, throttleEvents, settings] = await Promise.all([
+      providerUsageRepository.getSummary(),
+      providerUsageRepository.getAdminBreakdown(),
+      externalApiKeyRepository.list(),
+      candleRepository.getInventory({ limit: 100 }),
+      providerUsageRepository.getThrottleEvents({ limit: 50 }),
+      getAdminSettings(),
+    ]);
+
+    return {
+      usage,
+      breakdown,
+      runtimeMode: 'persistent',
+      apiKeys,
+      cacheInventory,
+      throttleEvents,
+      settings,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+
+  app.get('/api/admin/settings', async (request) => {
+    assertAdmin(request);
+
+    return { settings: await getAdminSettings() };
+  });
+
+  app.patch('/api/admin/settings', async (request) => {
+    assertAdmin(request);
+
+    const parsed = settingsPatchSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      throw badRequest(parsed.error.issues.map((issue) => issue.message).join(', '));
+    }
+
+    return { settings: await updateAdminSettings(toSettingsPatch(parsed.data)) };
+  });
+
+  app.get('/api/admin/cache/inventory', async (request) => {
+    assertAdmin(request);
+
+    const parsed = z
+      .object({
+        limit: z.coerce.number().int().positive().max(500).optional(),
+      })
+      .safeParse(request.query);
+
+    return {
+      markets: await candleRepository.getInventory({ limit: parsed.success ? parsed.data.limit : undefined }),
+    };
+  });
+
+  app.post('/api/admin/cache/load-persistent', async (request) => {
+    assertAdmin(request);
+
+    const parsed = z
+      .object({
+        limit: z.coerce.number().int().positive().max(500).optional(),
+      })
+      .safeParse(request.body);
+
+    const markets = await candleRepository.getInventory({ limit: parsed.success ? parsed.data.limit : undefined });
+    return {
+      mode: 'persistent',
+      importedMarkets: markets.length,
+      markets,
+    };
+  });
+
+  app.get('/api/admin/cache/export', async (request, reply) => {
+    assertAdmin(request);
+
+    const snapshot = await candleRepository.exportSnapshot('persistent');
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+    reply
+      .header('Content-Type', 'application/json')
+      .header('Content-Disposition', `attachment; filename="moralis-cache-${timestamp}.json"`);
+
+    return snapshot;
+  });
+
+  app.post('/api/admin/cache/import', async (request) => {
+    assertAdmin(request);
+
+    const parsed = cacheSnapshotSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      throw badRequest(parsed.error.issues.map((issue) => issue.message).join(', '));
+    }
+
+    const result = await candleRepository.importSnapshot(parsed.data);
+    return {
+      ...result,
+      totalSnapshotCandles: countSnapshotCandles(parsed.data),
+      markets: await candleRepository.getInventory({ limit: 100 }),
+    };
+  });
+
   app.post('/api/admin/charts/backfill', async (request) => {
     assertAdmin(request);
 
@@ -70,6 +196,7 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     }
 
     await redis.set('feature:moralis_ohlcv_enabled', parsed.data.enabled ? 'true' : 'false');
+    await updateAdminSettings({ moralisOhlcvEnabled: parsed.data.enabled });
 
     return { enabled: parsed.data.enabled };
   });
@@ -129,4 +256,24 @@ function assertAdmin(request: FastifyRequest) {
   if (header !== expected) {
     throw unauthorized();
   }
+}
+
+function toSettingsPatch(value: z.infer<typeof settingsPatchSchema>): AdminSettingsPatch {
+  const patch: AdminSettingsPatch = {};
+
+  if (value.moralisOhlcvEnabled !== undefined) patch.moralisOhlcvEnabled = value.moralisOhlcvEnabled;
+  if (value.moralisDailyCuBudget !== undefined) patch.moralisDailyCuBudget = value.moralisDailyCuBudget;
+  if (value.maxSyncMoralisPages !== undefined) patch.maxSyncMoralisPages = value.maxSyncMoralisPages;
+  if (value.maxSyncGapCandles !== undefined) patch.maxSyncGapCandles = value.maxSyncGapCandles;
+  if (value.externalApiKeyRequestRateLimit !== undefined) {
+    patch.externalApiKeyRequestRateLimit = value.externalApiKeyRequestRateLimit;
+  }
+  if (value.externalApiKeyCacheMissRateLimit !== undefined) {
+    patch.externalApiKeyCacheMissRateLimit = value.externalApiKeyCacheMissRateLimit;
+  }
+  if (value.externalApiKeyDailyCuBudget !== undefined) {
+    patch.externalApiKeyDailyCuBudget = value.externalApiKeyDailyCuBudget;
+  }
+
+  return patch;
 }

@@ -1,6 +1,6 @@
 import { buildChartCacheKey, getChartCacheTtl, getJsonCache, setJsonCache } from '../cache.js';
 import { findSuspiciousOhlcRanges, normalizeCandleOhlc } from '../candleQuality.js';
-import { config } from '../config.js';
+import { getAdminSettings } from '../adminConfig.js';
 import { findMissingRanges } from '../gaps.js';
 import { buildGapFetchLockKey, withRedisLock } from '../locks.js';
 import { fetchMoralisOhlcv } from '../moralis.js';
@@ -369,7 +369,9 @@ export async function getOhlcvForChart(params: {
 
       const estimatedGapCandles = estimateCandleCount(gap.from, gap.to, params.timeframe);
 
-      if (estimatedGapCandles > config.MAX_SYNC_GAP_CANDLES) {
+      const settings = await getAdminSettings();
+
+      if (estimatedGapCandles > settings.maxSyncGapCandles) {
         await enqueueBackfillJob({
           chain: params.chain,
           pairAddress,
@@ -404,7 +406,7 @@ export async function getOhlcvForChart(params: {
         to: gap.to,
       });
 
-      const maxPages = params.maxProviderPages ?? config.MAX_SYNC_MORALIS_PAGES;
+      const maxPages = params.maxProviderPages ?? settings.maxSyncMoralisPages;
 
       const fetchResult = await withRedisLock(lockKey, 30_000, async () => {
         providerFetches += 1;

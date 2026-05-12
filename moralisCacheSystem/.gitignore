@@ -8,6 +8,7 @@ logs/
 .local-external-api-key
 .local-proxy-usage.json
 .local-proxy-usage.jsonl
+.local-provider-throttle-events.jsonl
 npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*

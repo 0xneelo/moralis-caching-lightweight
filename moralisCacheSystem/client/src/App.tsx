@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AdminDashboard } from './AdminDashboard';
 import { ChartPanel } from './ChartPanel';
 import {
   fetchChartCandles,
@@ -51,6 +52,10 @@ const MIN_SCROLL_HISTORY_FROM = new Date('2024-01-01T00:00:00.000Z');
 type Side = 'buy' | 'sell';
 
 export function App() {
+  if (window.location.pathname.startsWith('/admin')) {
+    return <AdminDashboard />;
+  }
+
   const [pairAddress, setPairAddress] = useState(INITIAL_CHART_ROUTE.pairAddress);
   const [chain, setChain] = useState(INITIAL_CHART_ROUTE.chain);
   const [timeframe, setTimeframe] = useState<Timeframe>(INITIAL_CHART_ROUTE.timeframe);
@@ -644,6 +649,38 @@ export function App() {
             <strong>Modes</strong>
           </div>
 
+          <div className={debugColors ? 'dev-color-legend' : 'dev-color-legend muted'} aria-label="dev color legend">
+            <div className="tool-rail-section compact">
+              <span className="tool-rail-eyebrow">Dev colors</span>
+              <strong>{debugColors ? 'Source legend' : 'Disabled'}</strong>
+            </div>
+            <div className="legend-grid">
+              <div className="legend-row">
+                <span className="legend-swatch swatch-provider-up" />
+                <span className="legend-swatch swatch-provider-down" />
+                <span>Provider</span>
+              </div>
+              <div className="legend-row">
+                <span className="legend-swatch swatch-cache-up" />
+                <span className="legend-swatch swatch-cache-down" />
+                <span>Cache</span>
+              </div>
+              <div className="legend-row">
+                <span className="legend-swatch swatch-demo-up" />
+                <span className="legend-swatch swatch-demo-down" />
+                <span>Demo</span>
+              </div>
+              <div className="legend-row">
+                <span className="legend-swatch swatch-filled" />
+                <span>Filled gap</span>
+              </div>
+              <div className="legend-row">
+                <span className="legend-swatch swatch-synthetic" />
+                <span>Synthetic</span>
+              </div>
+            </div>
+          </div>
+
           <label
             className="visible-candle-field tool-rail-field has-tooltip"
             title={
@@ -712,36 +749,6 @@ export function App() {
           >
             {`Zooming: ${adaptiveZoomEnabled ? 'On' : 'Off'}`}
           </button>
-
-          <div className="dev-color-legend" aria-label="dev color legend">
-            <div className="tool-rail-section compact">
-              <span className="tool-rail-eyebrow">Dev colors</span>
-              <strong>{debugColors ? 'Source legend' : 'Disabled'}</strong>
-            </div>
-            <div className="legend-row">
-              <span className="legend-swatch swatch-provider-up" />
-              <span className="legend-swatch swatch-provider-down" />
-              <span>Provider / Moralis</span>
-            </div>
-            <div className="legend-row">
-              <span className="legend-swatch swatch-cache-up" />
-              <span className="legend-swatch swatch-cache-down" />
-              <span>Cache candles</span>
-            </div>
-            <div className="legend-row">
-              <span className="legend-swatch swatch-demo-up" />
-              <span className="legend-swatch swatch-demo-down" />
-              <span>Demo candles</span>
-            </div>
-            <div className="legend-row">
-              <span className="legend-swatch swatch-filled" />
-              <span>Filled gaps</span>
-            </div>
-            <div className="legend-row">
-              <span className="legend-swatch swatch-synthetic" />
-              <span>Synthetic bridges</span>
-            </div>
-          </div>
         </aside>
 
         <section className="chart-zone">
@@ -1243,4 +1250,3 @@ function logInteraction(payload: {
 function createInteractionId() {
   return `click_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
-

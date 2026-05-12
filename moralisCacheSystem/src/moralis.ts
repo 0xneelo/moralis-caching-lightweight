@@ -1,3 +1,4 @@
+import { getAdminSettings } from './adminConfig.js';
 import { config } from './config.js';
 import { appendInteractionTraceEvent } from './interactionLog.js';
 import { moralisLogger } from './logger.js';
@@ -27,12 +28,11 @@ export class MoralisProviderError extends Error {
 }
 
 export async function isMoralisOhlcvEnabled() {
-  if (!config.CHART_PROVIDER_ENABLED) {
-    return false;
-  }
-
   const flag = await redis.get('feature:moralis_ohlcv_enabled');
-  return flag !== 'false';
+  if (flag === 'false') return false;
+  if (flag === 'true') return true;
+
+  return (await getAdminSettings()).moralisOhlcvEnabled;
 }
 
 export async function assertMoralisOhlcvEnabled() {
@@ -50,7 +50,9 @@ export async function assertDailyMoralisBudgetAvailable(extraCu: number) {
     to: now,
   });
 
-  if (usedToday + extraCu > config.MORALIS_DAILY_CU_BUDGET) {
+  const settings = await getAdminSettings();
+
+  if (usedToday + extraCu > settings.moralisDailyCuBudget) {
     throw new Error('Moralis daily CU budget exceeded');
   }
 }
@@ -72,7 +74,8 @@ export async function fetchMoralisOhlcv(params: {
     throw new Error('MORALIS_API_KEY is required to call Moralis');
   }
 
-  const maxPages = params.maxPages ?? config.MAX_SYNC_MORALIS_PAGES;
+  const settings = await getAdminSettings();
+  const maxPages = params.maxPages ?? settings.maxSyncMoralisPages;
   await assertDailyMoralisBudgetAvailable(maxPages * MORALIS_OHLC_CU_COST);
 
   const result = params.chain === 'solana' && shouldAggregateSolanaTimeframe(params.timeframe)

@@ -1,6 +1,6 @@
 import { redis } from './redis.js';
 import { tooManyRequests } from './httpErrors.js';
-import { config } from './config.js';
+import { getAdminSettings } from './adminConfig.js';
 import { providerUsageRepository } from './repositories/providerUsage.js';
 
 export async function enforceChartRateLimit(params: {
@@ -40,16 +40,18 @@ export async function enforceProviderMissRateLimit(params: {
 
 export async function enforceExternalApiKeyRequestRateLimit(params: { apiKeyId: string }) {
   const count = await incrementWindow(`rate:external-api-key:${params.apiKeyId}:requests`, 60);
+  const settings = await getAdminSettings();
 
-  if (count > config.EXTERNAL_API_KEY_REQUEST_RATE_LIMIT) {
+  if (count > settings.externalApiKeyRequestRateLimit) {
     throw tooManyRequests('External API key request rate limit exceeded');
   }
 }
 
 export async function enforceExternalApiKeyCacheMissRateLimit(params: { apiKeyId: string }) {
   const count = await incrementWindow(`rate:external-api-key:${params.apiKeyId}:cache-miss`, 60);
+  const settings = await getAdminSettings();
 
-  if (count > config.EXTERNAL_API_KEY_CACHE_MISS_RATE_LIMIT) {
+  if (count > settings.externalApiKeyCacheMissRateLimit) {
     throw tooManyRequests('External API key cache miss rate limit exceeded');
   }
 }
@@ -67,7 +69,9 @@ export async function assertExternalApiKeyCuBudgetAvailable(params: {
     externalApiKeyId: params.apiKeyId,
   });
 
-  if (usedToday + params.estimatedCu > config.EXTERNAL_API_KEY_DAILY_CU_BUDGET) {
+  const settings = await getAdminSettings();
+
+  if (usedToday + params.estimatedCu > settings.externalApiKeyDailyCuBudget) {
     throw tooManyRequests('External API key daily CU budget exceeded');
   }
 }

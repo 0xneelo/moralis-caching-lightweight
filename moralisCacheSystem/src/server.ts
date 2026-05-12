@@ -28,6 +28,7 @@ export async function buildServer() {
             level: config.LOG_LEVEL,
           },
     trustProxy: true,
+    bodyLimit: 100 * 1024 * 1024,
   });
 
   await app.register(cors, {

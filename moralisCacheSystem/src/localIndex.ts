@@ -3,7 +3,14 @@ import Fastify from 'fastify';
 import type { FastifyReply } from 'fastify';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import { Pool } from 'pg';
 import { z } from 'zod';
+import {
+  CACHE_SNAPSHOT_FORMAT,
+  cacheSnapshotSchema,
+  countSnapshotCandles,
+  type CacheSnapshot,
+} from './cacheSnapshot.js';
 import { config } from './config.js';
 import { findMissingRanges } from './gaps.js';
 import { appendInteractionTraceEvent, writeInteractionLogFile } from './interactionLog.js';
@@ -42,6 +49,17 @@ const marketHistoryState = new Map<
 >();
 const activeProviderFetches = new Set<string>();
 const providerFetchCooldowns = new Map<string, number>();
+let persistentCacheInventorySnapshot: Array<{
+  chain: string;
+  pairAddress: string;
+  timeframe: string;
+  currency: string;
+  candleCount: number;
+  firstCandleAt: string | null;
+  lastCandleAt: string | null;
+  updatedAt: string | null;
+}> = [];
+let persistentCacheSnapshotLoaded = false;
 
 type MoralisCompatCursor = {
   fromDate: string;
@@ -94,6 +112,15 @@ type LocalThrottleEvent = {
 };
 
 const usage = await loadLocalProxyUsage();
+const localAdminSettings = {
+  moralisOhlcvEnabled: config.CHART_PROVIDER_ENABLED,
+  moralisDailyCuBudget: config.MORALIS_DAILY_CU_BUDGET,
+  maxSyncMoralisPages: config.MAX_SYNC_MORALIS_PAGES,
+  maxSyncGapCandles: config.MAX_SYNC_GAP_CANDLES,
+  externalApiKeyRequestRateLimit: config.EXTERNAL_API_KEY_REQUEST_RATE_LIMIT,
+  externalApiKeyCacheMissRateLimit: config.EXTERNAL_API_KEY_CACHE_MISS_RATE_LIMIT,
+  externalApiKeyDailyCuBudget: config.EXTERNAL_API_KEY_DAILY_CU_BUDGET,
+};
 
 const chartQuerySchema = z.object({
   chain: z.string().min(1),
@@ -134,6 +161,7 @@ const localExternalApiKey = await ensureLocalExternalApiKey();
 const app = Fastify({
   loggerInstance: logger,
   trustProxy: true,
+  bodyLimit: 100 * 1024 * 1024,
 });
 
 await app.register(cors, {
@@ -157,6 +185,152 @@ app.get('/api/usage/moralis/cooldown-skips', async (request) => {
 
   return {
     events: await readLocalThrottleEvents(limit ?? 200),
+  };
+});
+
+app.get('/api/admin/session', async (request, reply) => {
+  if (!assertLocalAdmin(request.headers.authorization?.toString())) {
+    return reply.status(401).send({ error: 'Unauthorized' });
+  }
+
+  return { ok: true, settings: localAdminSettings };
+});
+
+app.get('/api/admin/dashboard', async (request, reply) => {
+  if (!assertLocalAdmin(request.headers.authorization?.toString())) {
+    return reply.status(401).send({ error: 'Unauthorized' });
+  }
+
+  const cacheInventory = getAdminCacheInventory(100);
+
+  return {
+    usage,
+    breakdown: await buildLocalAdminBreakdown(),
+    runtimeMode: persistentCacheSnapshotLoaded ? 'persistent-snapshot' : 'local-memory',
+    apiKeys: [
+      {
+        id: 'local-external-api-key',
+        name: 'Local external API key',
+        keyPrefix: localExternalApiKey.slice(0, 16),
+        scopes: ['ohlcv:read'],
+        active: true,
+        requestCount: usage.totalRequests,
+        createdAt: usage.since,
+        lastUsedAt: usage.updatedAt,
+        revokedAt: null,
+      },
+    ],
+    cacheInventory,
+    throttleEvents: await readLocalThrottleEvents(50),
+    settings: localAdminSettings,
+    updatedAt: new Date().toISOString(),
+  };
+});
+
+app.get('/api/admin/settings', async (request, reply) => {
+  if (!assertLocalAdmin(request.headers.authorization?.toString())) {
+    return reply.status(401).send({ error: 'Unauthorized' });
+  }
+
+  return { settings: localAdminSettings };
+});
+
+app.patch('/api/admin/settings', async (request, reply) => {
+  if (!assertLocalAdmin(request.headers.authorization?.toString())) {
+    return reply.status(401).send({ error: 'Unauthorized' });
+  }
+
+  const parsed = z
+    .object({
+      moralisOhlcvEnabled: z.boolean().optional(),
+      moralisDailyCuBudget: z.number().int().positive().optional(),
+      maxSyncMoralisPages: z.number().int().positive().optional(),
+      maxSyncGapCandles: z.number().int().positive().optional(),
+      externalApiKeyRequestRateLimit: z.number().int().positive().optional(),
+      externalApiKeyCacheMissRateLimit: z.number().int().positive().optional(),
+      externalApiKeyDailyCuBudget: z.number().int().positive().optional(),
+    })
+    .safeParse(request.body);
+
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.issues.map((issue) => issue.message).join(', ') });
+  }
+
+  Object.assign(localAdminSettings, parsed.data);
+  return { settings: localAdminSettings };
+});
+
+app.get('/api/admin/cache/inventory', async (request, reply) => {
+  if (!assertLocalAdmin(request.headers.authorization?.toString())) {
+    return reply.status(401).send({ error: 'Unauthorized' });
+  }
+
+  const parsed = z
+    .object({ limit: z.coerce.number().int().positive().max(500).optional() })
+    .safeParse(request.query);
+
+  const limit = parsed.success ? parsed.data.limit ?? 100 : 100;
+  const markets = getAdminCacheInventory(limit);
+  return { markets };
+});
+
+app.post('/api/admin/cache/load-persistent', async (request, reply) => {
+  if (!assertLocalAdmin(request.headers.authorization?.toString())) {
+    return reply.status(401).send({ error: 'Unauthorized' });
+  }
+
+  const parsed = z
+    .object({ limit: z.coerce.number().int().positive().max(500).optional() })
+    .safeParse(request.body);
+
+  const limit = parsed.success ? parsed.data.limit ?? 100 : 100;
+
+  try {
+    const markets = await loadPersistentCacheInventory(limit);
+    persistentCacheInventorySnapshot = markets;
+    persistentCacheSnapshotLoaded = true;
+    return {
+      mode: 'persistent-snapshot',
+      importedMarkets: markets.length,
+      markets: getAdminCacheInventory(limit),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Persistent cache load failed';
+    return reply.status(503).send({ error: message });
+  }
+});
+
+app.get('/api/admin/cache/export', async (request, reply) => {
+  if (!assertLocalAdmin(request.headers.authorization?.toString())) {
+    return reply.status(401).send({ error: 'Unauthorized' });
+  }
+
+  const snapshot = await buildCurrentLocalExportSnapshot();
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+  reply
+    .header('Content-Type', 'application/json')
+    .header('Content-Disposition', `attachment; filename="moralis-cache-${timestamp}.json"`);
+
+  return snapshot;
+});
+
+app.post('/api/admin/cache/import', async (request, reply) => {
+  if (!assertLocalAdmin(request.headers.authorization?.toString())) {
+    return reply.status(401).send({ error: 'Unauthorized' });
+  }
+
+  const parsed = cacheSnapshotSchema.safeParse(request.body);
+
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.issues.map((issue) => issue.message).join(', ') });
+  }
+
+  const result = importSnapshotToLocalMemory(parsed.data);
+  return {
+    ...result,
+    totalSnapshotCandles: countSnapshotCandles(parsed.data),
+    markets: getAdminCacheInventory(100),
   };
 });
 
@@ -968,6 +1142,129 @@ function setMoralisCompatHeaders(
   reply.header('x-page-to', params.pageTo?.toISOString() ?? '');
 }
 
+function assertLocalAdmin(authorization: string | undefined) {
+  const token = authorization?.replace(/^Bearer\s+/i, '').trim();
+  const expected = config.ADMIN_API_KEY || localExternalApiKey;
+
+  return Boolean(token && expected && token === expected);
+}
+
+async function buildLocalAdminBreakdown() {
+  const events = await readLocalUsageEvents(500);
+  const sinceMs = Date.now() - 24 * 60 * 60 * 1000;
+  const recent24h = events.filter((event) => new Date(event.timestamp).getTime() >= sinceMs);
+  const byEndpoint = new Map<string, {
+    requestCount: number;
+    estimatedCu: number;
+    avgDurationMs: null;
+    errorCount: number;
+  }>();
+  const byHour = new Map<string, { requestCount: number; estimatedCu: number }>();
+
+  for (const event of recent24h) {
+    const endpoint = byEndpoint.get(event.endpoint) ?? {
+      requestCount: 0,
+      estimatedCu: 0,
+      avgDurationMs: null,
+      errorCount: 0,
+    };
+    endpoint.requestCount += event.pages;
+    endpoint.estimatedCu += event.estimatedCu;
+    byEndpoint.set(event.endpoint, endpoint);
+
+    const hour = new Date(event.timestamp);
+    hour.setUTCMinutes(0, 0, 0);
+    const hourKey = hour.toISOString();
+    const hourBucket = byHour.get(hourKey) ?? { requestCount: 0, estimatedCu: 0 };
+    hourBucket.requestCount += event.pages;
+    hourBucket.estimatedCu += event.estimatedCu;
+    byHour.set(hourKey, hourBucket);
+  }
+
+  return {
+    endpoints24h: [...byEndpoint.entries()].map(([endpoint, value]) => ({ endpoint, ...value })),
+    externalKeys24h: [
+      {
+        externalApiKeyId: 'local-external-api-key',
+        apiKeyName: 'Local external API key',
+        requestCount: recent24h.reduce((sum, event) => sum + event.pages, 0),
+        estimatedCu: recent24h.reduce((sum, event) => sum + event.estimatedCu, 0),
+        lastSeenAt: recent24h.at(-1)?.timestamp ?? null,
+      },
+    ],
+    hourly24h: [...byHour.entries()]
+      .map(([hour, value]) => ({ hour, ...value }))
+      .sort((left, right) => left.hour.localeCompare(right.hour)),
+    recent: events.slice(-100).reverse().map((event) => ({
+      createdAt: event.timestamp,
+      endpoint: event.endpoint,
+      externalApiKeyId: 'local-external-api-key',
+      chain: event.chain,
+      pairAddress: event.pairAddress,
+      timeframe: event.timeframe,
+      httpStatus: 200,
+      estimatedCu: event.estimatedCu,
+      pages: event.pages,
+      durationMs: null,
+    })),
+  };
+}
+
+function getLocalCacheInventory(limit: number) {
+  return [...candles.entries()]
+    .map(([key, values]) => {
+      const [chain, pairAddress, timeframe, currency] = key.split(':');
+      const sorted = [...values].sort((left, right) => left.time - right.time);
+
+      return {
+        chain: chain ?? '',
+        pairAddress: pairAddress ?? '',
+        timeframe: timeframe ?? '',
+        currency: currency ?? 'usd',
+        candleCount: values.length,
+        firstCandleAt: sorted[0]?.timestamp ?? null,
+        lastCandleAt: sorted.at(-1)?.timestamp ?? null,
+        updatedAt: sorted.at(-1)?.timestamp ?? null,
+      };
+    })
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    .slice(0, limit);
+}
+
+function getAdminCacheInventory(limit: number) {
+  const normalizedLimit = Math.max(1, Math.min(500, limit));
+  const localInventory = getLocalCacheInventory(normalizedLimit);
+
+  if (!persistentCacheSnapshotLoaded || persistentCacheInventorySnapshot.length === 0) {
+    return localInventory;
+  }
+
+  const merged = new Map<string, {
+    chain: string;
+    pairAddress: string;
+    timeframe: string;
+    currency: string;
+    candleCount: number;
+    firstCandleAt: string | null;
+    lastCandleAt: string | null;
+    updatedAt: string | null;
+  }>();
+
+  for (const market of persistentCacheInventorySnapshot) {
+    const key = [market.chain, market.pairAddress, market.timeframe, market.currency].join(':');
+    merged.set(key, market);
+  }
+
+  for (const market of localInventory) {
+    const key = [market.chain, market.pairAddress, market.timeframe, market.currency].join(':');
+    merged.set(key, market);
+  }
+
+  return [...merged.values()]
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    .slice(0, normalizedLimit);
+}
+
 function buildKey(params: {
   chain: string;
   pairAddress: string;
@@ -1010,6 +1307,226 @@ function buildProviderFetchKey(params: {
   currency: string;
 }) {
   return [params.chain, params.pairAddress, params.currency].join(':');
+}
+
+async function loadPersistentCacheInventory(limit: number) {
+  const pool = new Pool({ connectionString: config.DATABASE_URL });
+
+  try {
+    const result = await pool.query<{
+      chain: string;
+      pair_address: string;
+      timeframe: string;
+      currency: string;
+      candle_count: string;
+      first_candle_at: Date | null;
+      last_candle_at: Date | null;
+      updated_at: Date | null;
+    }>(
+      `
+      SELECT
+        chain,
+        pair_address,
+        timeframe,
+        currency,
+        count(*)::text AS candle_count,
+        min(timestamp) AS first_candle_at,
+        max(timestamp) AS last_candle_at,
+        max(updated_at) AS updated_at
+      FROM ohlcv_candles
+      GROUP BY chain, pair_address, timeframe, currency
+      ORDER BY max(updated_at) DESC
+      LIMIT $1
+      `,
+      [Math.max(1, Math.min(500, limit))]
+    );
+
+    return result.rows.map((row) => ({
+      chain: row.chain,
+      pairAddress: row.pair_address,
+      timeframe: row.timeframe,
+      currency: row.currency,
+      candleCount: Number(row.candle_count),
+      firstCandleAt: row.first_candle_at?.toISOString() ?? null,
+      lastCandleAt: row.last_candle_at?.toISOString() ?? null,
+      updatedAt: row.updated_at?.toISOString() ?? null,
+    }));
+  } catch (error) {
+    logger.error({ error }, 'Failed to load persistent cache inventory');
+    throw new Error('Could not read persistent cache from Postgres. Check DATABASE_URL and migrations.');
+  } finally {
+    await pool.end().catch(() => undefined);
+  }
+}
+
+async function buildCurrentLocalExportSnapshot() {
+  const localSnapshot = buildLocalMemoryCacheSnapshot();
+
+  if (persistentCacheSnapshotLoaded || localSnapshot.markets.length === 0) {
+    try {
+      const persistentSnapshot = await loadPersistentCacheSnapshot();
+
+      if (persistentSnapshot.markets.length > 0) {
+        return persistentSnapshot;
+      }
+    } catch (error) {
+      logger.warn({ error }, 'Persistent cache snapshot export unavailable; falling back to local memory cache');
+    }
+  }
+
+  return localSnapshot;
+}
+
+function buildLocalMemoryCacheSnapshot(): CacheSnapshot {
+  const markets: CacheSnapshot['markets'] = [];
+
+  for (const [key, values] of candles.entries()) {
+    const [chain, pairAddress, timeframe, currency] = key.split(':');
+
+    if (
+      !chain ||
+      !pairAddress ||
+      !timeframe ||
+      !isOhlcvTimeframe(timeframe) ||
+      (currency !== 'usd' && currency !== 'native')
+    ) {
+      continue;
+    }
+
+    markets.push({
+      chain,
+      pairAddress,
+      timeframe,
+      currency,
+      candles: [...values]
+        .sort((left, right) => left.time - right.time)
+        .map((candle) => ({
+          timestamp: candle.timestamp,
+          open: candle.open,
+          high: candle.high,
+          low: candle.low,
+          close: candle.close,
+          ...(candle.volume !== null ? { volume: candle.volume } : {}),
+          ...(candle.trades !== null ? { trades: candle.trades } : {}),
+        })),
+    });
+  }
+
+  return {
+    format: CACHE_SNAPSHOT_FORMAT,
+    exportedAt: new Date().toISOString(),
+    sourceRuntimeMode: persistentCacheSnapshotLoaded ? 'persistent-snapshot+local-memory' : 'local-memory',
+    markets,
+  };
+}
+
+async function loadPersistentCacheSnapshot(): Promise<CacheSnapshot> {
+  const pool = new Pool({ connectionString: config.DATABASE_URL });
+
+  try {
+    const result = await pool.query<{
+      chain: string;
+      pair_address: string;
+      timeframe: OhlcvTimeframe;
+      currency: OhlcvCurrency;
+      timestamp: Date;
+      open: string;
+      high: string;
+      low: string;
+      close: string;
+      volume: string | null;
+      trades: number | null;
+    }>(
+      `
+      SELECT
+        chain,
+        pair_address,
+        timeframe,
+        currency,
+        timestamp,
+        open,
+        high,
+        low,
+        close,
+        volume,
+        trades
+      FROM ohlcv_candles
+      ORDER BY chain, pair_address, timeframe, currency, timestamp ASC
+      `
+    );
+
+    const markets = new Map<string, CacheSnapshot['markets'][number]>();
+
+    for (const row of result.rows) {
+      const key = [row.chain, row.pair_address, row.timeframe, row.currency].join(':');
+      const market =
+        markets.get(key) ??
+        {
+          chain: row.chain,
+          pairAddress: row.pair_address,
+          timeframe: row.timeframe,
+          currency: row.currency,
+          candles: [],
+        };
+
+      market.candles.push({
+        timestamp: row.timestamp.toISOString(),
+        open: Number(row.open),
+        high: Number(row.high),
+        low: Number(row.low),
+        close: Number(row.close),
+        ...(row.volume !== null ? { volume: Number(row.volume) } : {}),
+        ...(row.trades !== null ? { trades: row.trades } : {}),
+      });
+      markets.set(key, market);
+    }
+
+    return {
+      format: CACHE_SNAPSHOT_FORMAT,
+      exportedAt: new Date().toISOString(),
+      sourceRuntimeMode: 'persistent-snapshot',
+      markets: [...markets.values()],
+    };
+  } finally {
+    await pool.end().catch(() => undefined);
+  }
+}
+
+function importSnapshotToLocalMemory(snapshot: CacheSnapshot) {
+  let importedCandles = 0;
+
+  for (const market of snapshot.markets) {
+    const candleKey = buildCandleKey({
+      chain: market.chain,
+      pairAddress: market.pairAddress,
+      timeframe: market.timeframe,
+      currency: market.currency,
+    });
+    const incoming = market.candles.map((candle) =>
+      normalizeChartCandle({
+        time: Math.floor(new Date(candle.timestamp).getTime() / 1000),
+        timestamp: candle.timestamp,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume ?? null,
+        trades: candle.trades ?? null,
+        source: 'cache',
+      })
+    );
+
+    candles.set(candleKey, mergeCandles(candles.get(candleKey) ?? [], incoming));
+    importedCandles += incoming.length;
+  }
+
+  persistentCacheSnapshotLoaded = false;
+  persistentCacheInventorySnapshot = [];
+
+  return {
+    importedMarkets: snapshot.markets.length,
+    importedCandles,
+  };
 }
 
 function isLocalFullHistoryRangeRequest(params: {
@@ -1821,6 +2338,39 @@ async function readLocalThrottleEvents(limit: number) {
         file: LOCAL_THROTTLE_EVENTS_FILE,
       },
       'Failed to read local throttle events.'
+    );
+    return [];
+  }
+}
+
+async function readLocalUsageEvents(limit: number) {
+  try {
+    const raw = await fs.readFile(LOCAL_PROXY_USAGE_EVENTS_FILE, 'utf8');
+    const rows = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line) as LocalProxyUsageEvent;
+        } catch {
+          return null;
+        }
+      })
+      .filter((event): event is LocalProxyUsageEvent => event !== null);
+
+    return rows.slice(-limit);
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      return [];
+    }
+
+    logger.warn(
+      {
+        error,
+        file: LOCAL_PROXY_USAGE_EVENTS_FILE,
+      },
+      'Failed to read local usage events.'
     );
     return [];
   }

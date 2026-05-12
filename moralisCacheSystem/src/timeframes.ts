@@ -91,11 +91,7 @@ export function getMinimumAdaptiveTimeframeForRange(from: Date, to: Date): Ohlcv
     return '4h';
   }
 
-  if (spanMs <= 120 * DAY_MS) {
-    return '12h';
-  }
-
-  return '1d';
+  return '12h';
 }
 
 export function getEffectiveAdaptiveTimeframe(params: {

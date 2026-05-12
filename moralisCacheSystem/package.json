@@ -22,7 +22,7 @@
     "schedule": "tsx src/scripts/schedule.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:frontend": "tsc -p client/tsconfig.json --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --exclude dist/**",
     "test:e2e": "vitest run src/e2e",
     "test:e2e:full": "npm run typecheck && npm run typecheck:frontend && npm run test:e2e && npm run build:all",
     "test:e2e:real": "npm run migrate && npm run test:e2e"

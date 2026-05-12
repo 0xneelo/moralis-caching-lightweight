@@ -92,6 +92,96 @@ export type PairMetadata = {
   dexId?: string;
 };
 
+export type AdminSettings = {
+  moralisOhlcvEnabled: boolean;
+  moralisDailyCuBudget: number;
+  maxSyncMoralisPages: number;
+  maxSyncGapCandles: number;
+  externalApiKeyRequestRateLimit: number;
+  externalApiKeyCacheMissRateLimit: number;
+  externalApiKeyDailyCuBudget: number;
+};
+
+export type AdminApiKey = {
+  id: string;
+  name: string;
+  keyPrefix: string;
+  scopes: string[];
+  active: boolean;
+  requestCount: number;
+  createdAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+};
+
+export type AdminCacheMarket = {
+  chain: string;
+  pairAddress: string;
+  timeframe: string;
+  currency: string;
+  candleCount: number;
+  firstCandleAt: string | null;
+  lastCandleAt: string | null;
+  updatedAt: string | null;
+};
+
+export type AdminDashboard = {
+  usage: MoralisUsage;
+  settings: AdminSettings;
+  runtimeMode: string;
+  apiKeys: AdminApiKey[];
+  cacheInventory: AdminCacheMarket[];
+  throttleEvents: Array<{
+    timestamp: string;
+    reason: string;
+    chain: string | null;
+    pairAddress: string | null;
+    timeframe: string | null;
+    requestFrom: string | null;
+    requestTo: string | null;
+    detailMs: number | null;
+  }>;
+  breakdown: {
+    endpoints24h: Array<{
+      endpoint: string;
+      requestCount: number;
+      estimatedCu: number;
+      avgDurationMs: number | null;
+      errorCount: number;
+    }>;
+    externalKeys24h: Array<{
+      externalApiKeyId: string | null;
+      apiKeyName: string | null;
+      requestCount: number;
+      estimatedCu: number;
+      lastSeenAt: string | null;
+    }>;
+    hourly24h: Array<{
+      hour: string;
+      requestCount: number;
+      estimatedCu: number;
+    }>;
+    recent: Array<{
+      createdAt: string;
+      endpoint: string;
+      externalApiKeyId: string | null;
+      chain: string | null;
+      pairAddress: string | null;
+      timeframe: string | null;
+      httpStatus: number | null;
+      estimatedCu: number;
+      pages: number;
+      durationMs: number | null;
+    }>;
+  };
+  updatedAt: string;
+};
+
+export type CreatedAdminApiKey = {
+  apiKey: string;
+  record: AdminApiKey;
+};
+
 const timeframeSeconds: Record<Timeframe, number> = {
   '1min': 60,
   '5min': 5 * 60,
@@ -351,6 +441,141 @@ export async function fetchMoralisUsage() {
   }
 
   return (await response.json()) as MoralisUsage;
+}
+
+export async function fetchAdminDashboard(adminKey: string) {
+  const response = await fetch('/api/admin/dashboard', {
+    headers: getAdminHeaders(adminKey),
+  });
+
+  if (!response.ok) {
+    throw new Error(await getApiError(response, 'Admin dashboard request failed'));
+  }
+
+  return (await response.json()) as AdminDashboard;
+}
+
+export async function updateAdminSettings(adminKey: string, settings: Partial<AdminSettings>) {
+  const response = await fetch('/api/admin/settings', {
+    method: 'PATCH',
+    headers: {
+      ...getAdminHeaders(adminKey),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(settings),
+  });
+
+  if (!response.ok) {
+    throw new Error(await getApiError(response, 'Admin settings update failed'));
+  }
+
+  return ((await response.json()) as { settings: AdminSettings }).settings;
+}
+
+export async function createAdminExternalApiKey(adminKey: string, name: string) {
+  const response = await fetch('/api/admin/api-keys', {
+    method: 'POST',
+    headers: {
+      ...getAdminHeaders(adminKey),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ name, scopes: ['ohlcv:read'] }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await getApiError(response, 'API key creation failed'));
+  }
+
+  return (await response.json()) as CreatedAdminApiKey;
+}
+
+export async function revokeAdminExternalApiKey(adminKey: string, id: string) {
+  const response = await fetch(`/api/admin/api-keys/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: getAdminHeaders(adminKey),
+  });
+
+  if (!response.ok) {
+    throw new Error(await getApiError(response, 'API key revoke failed'));
+  }
+}
+
+export async function loadAdminPersistentCache(adminKey: string, limit = 100) {
+  const response = await fetch('/api/admin/cache/load-persistent', {
+    method: 'POST',
+    headers: {
+      ...getAdminHeaders(adminKey),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ limit }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await getApiError(response, 'Persistent cache load failed'));
+  }
+
+  return (await response.json()) as {
+    mode: string;
+    markets: AdminCacheMarket[];
+    importedMarkets: number;
+  };
+}
+
+export async function downloadAdminCacheSnapshot(adminKey: string) {
+  const response = await fetch('/api/admin/cache/export', {
+    headers: getAdminHeaders(adminKey),
+  });
+
+  if (!response.ok) {
+    throw new Error(await getApiError(response, 'Cache export failed'));
+  }
+
+  return {
+    blob: await response.blob(),
+    filename: getDownloadFilename(response.headers.get('content-disposition')) ?? 'moralis-cache.json',
+  };
+}
+
+export async function importAdminCacheSnapshot(adminKey: string, snapshot: unknown) {
+  const response = await fetch('/api/admin/cache/import', {
+    method: 'POST',
+    headers: {
+      ...getAdminHeaders(adminKey),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(snapshot),
+  });
+
+  if (!response.ok) {
+    throw new Error(await getApiError(response, 'Cache import failed'));
+  }
+
+  return (await response.json()) as {
+    importedMarkets: number;
+    importedCandles: number;
+    totalSnapshotCandles: number;
+    markets: AdminCacheMarket[];
+  };
+}
+
+function getAdminHeaders(adminKey: string) {
+  return {
+    Authorization: `Bearer ${adminKey}`,
+  };
+}
+
+async function getApiError(response: Response, fallback: string) {
+  const body = await response.json().catch(() => null);
+  if (body && typeof body === 'object' && 'error' in body && typeof body.error === 'string') {
+    return body.error;
+  }
+
+  return `${fallback} with ${response.status}`;
+}
+
+function getDownloadFilename(contentDisposition: string | null) {
+  const match = contentDisposition?.match(/filename="([^"]+)"/i);
+  return match?.[1];
 }
 
 export async function fetchPairMetadata(params: {

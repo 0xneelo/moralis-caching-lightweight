@@ -195,4 +195,139 @@ export const providerUsageRepository = {
       detailMs: row.detail_ms,
     }));
   },
+
+  async getAdminBreakdown() {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const [endpointResult, keyResult, hourlyResult, recentResult] = await Promise.all([
+      query<{
+        endpoint: string;
+        request_count: string;
+        estimated_cu: string;
+        avg_duration_ms: string | null;
+        error_count: string;
+      }>(
+        `
+        SELECT
+          endpoint,
+          count(*)::text AS request_count,
+          COALESCE(sum(estimated_cu), 0)::text AS estimated_cu,
+          round(avg(duration_ms))::text AS avg_duration_ms,
+          count(*) FILTER (WHERE http_status >= 400)::text AS error_count
+        FROM provider_api_usage
+        WHERE provider = 'moralis'
+          AND created_at >= $1
+        GROUP BY endpoint
+        ORDER BY COALESCE(sum(estimated_cu), 0) DESC, count(*) DESC
+        LIMIT 20
+        `,
+        [since]
+      ),
+      query<{
+        external_api_key_id: string | null;
+        api_key_name: string | null;
+        request_count: string;
+        estimated_cu: string;
+        last_seen_at: Date | null;
+      }>(
+        `
+        SELECT
+          usage.external_api_key_id,
+          keys.name AS api_key_name,
+          count(*)::text AS request_count,
+          COALESCE(sum(usage.estimated_cu), 0)::text AS estimated_cu,
+          max(usage.created_at) AS last_seen_at
+        FROM provider_api_usage usage
+        LEFT JOIN external_api_keys keys ON keys.id = usage.external_api_key_id
+        WHERE usage.provider = 'moralis'
+          AND usage.created_at >= $1
+        GROUP BY usage.external_api_key_id, keys.name
+        ORDER BY COALESCE(sum(usage.estimated_cu), 0) DESC, count(*) DESC
+        LIMIT 20
+        `,
+        [since]
+      ),
+      query<{
+        hour: Date;
+        request_count: string;
+        estimated_cu: string;
+      }>(
+        `
+        SELECT
+          date_trunc('hour', created_at) AS hour,
+          count(*)::text AS request_count,
+          COALESCE(sum(estimated_cu), 0)::text AS estimated_cu
+        FROM provider_api_usage
+        WHERE provider = 'moralis'
+          AND created_at >= $1
+        GROUP BY hour
+        ORDER BY hour ASC
+        `,
+        [since]
+      ),
+      query<{
+        created_at: Date;
+        endpoint: string;
+        external_api_key_id: string | null;
+        chain: string | null;
+        pair_address: string | null;
+        timeframe: OhlcvTimeframe | null;
+        http_status: number | null;
+        estimated_cu: number;
+        pages: number;
+        duration_ms: number | null;
+      }>(
+        `
+        SELECT
+          created_at,
+          endpoint,
+          external_api_key_id,
+          chain,
+          pair_address,
+          timeframe,
+          http_status,
+          estimated_cu,
+          pages,
+          duration_ms
+        FROM provider_api_usage
+        WHERE provider = 'moralis'
+        ORDER BY created_at DESC
+        LIMIT 100
+        `
+      ),
+    ]);
+
+    return {
+      endpoints24h: endpointResult.rows.map((row) => ({
+        endpoint: row.endpoint,
+        requestCount: Number(row.request_count),
+        estimatedCu: Number(row.estimated_cu),
+        avgDurationMs: row.avg_duration_ms === null ? null : Number(row.avg_duration_ms),
+        errorCount: Number(row.error_count),
+      })),
+      externalKeys24h: keyResult.rows.map((row) => ({
+        externalApiKeyId: row.external_api_key_id,
+        apiKeyName: row.api_key_name,
+        requestCount: Number(row.request_count),
+        estimatedCu: Number(row.estimated_cu),
+        lastSeenAt: row.last_seen_at?.toISOString() ?? null,
+      })),
+      hourly24h: hourlyResult.rows.map((row) => ({
+        hour: row.hour.toISOString(),
+        requestCount: Number(row.request_count),
+        estimatedCu: Number(row.estimated_cu),
+      })),
+      recent: recentResult.rows.map((row) => ({
+        createdAt: row.created_at.toISOString(),
+        endpoint: row.endpoint,
+        externalApiKeyId: row.external_api_key_id,
+        chain: row.chain,
+        pairAddress: row.pair_address,
+        timeframe: row.timeframe,
+        httpStatus: row.http_status,
+        estimatedCu: row.estimated_cu,
+        pages: row.pages,
+        durationMs: row.duration_ms,
+      })),
+    };
+  },
 };
