@@ -22,11 +22,18 @@ export type AdminSettings = {
 };
 
 export type AdminSettingsPatch = Partial<AdminSettings>;
+const ADMIN_SETTINGS_CACHE_TTL_MS = 1_000;
+let cachedSettings: { value: AdminSettings; expiresAt: number } | null = null;
 
 export async function getAdminSettings(): Promise<AdminSettings> {
+  const now = Date.now();
+  if (cachedSettings && cachedSettings.expiresAt > now) {
+    return cachedSettings.value;
+  }
+
   const values = await Promise.all(Object.values(SETTING_KEYS).map((key) => redis.get(key)));
 
-  return {
+  const settings = {
     moralisOhlcvEnabled: parseBoolean(values[0] ?? null, config.CHART_PROVIDER_ENABLED),
     moralisDailyCuBudget: parsePositiveInt(values[1] ?? null, config.MORALIS_DAILY_CU_BUDGET),
     maxSyncMoralisPages: parsePositiveInt(values[2] ?? null, config.MAX_SYNC_MORALIS_PAGES),
@@ -41,6 +48,13 @@ export async function getAdminSettings(): Promise<AdminSettings> {
     ),
     externalApiKeyDailyCuBudget: parsePositiveInt(values[6] ?? null, config.EXTERNAL_API_KEY_DAILY_CU_BUDGET),
   };
+
+  cachedSettings = {
+    value: settings,
+    expiresAt: now + ADMIN_SETTINGS_CACHE_TTL_MS,
+  };
+
+  return settings;
 }
 
 export async function updateAdminSettings(patch: AdminSettingsPatch): Promise<AdminSettings> {
@@ -49,6 +63,7 @@ export async function updateAdminSettings(patch: AdminSettingsPatch): Promise<Ad
   for (const [key, value] of entries) {
     await redis.set(SETTING_KEYS[key], String(value));
   }
+  cachedSettings = null;
 
   return getAdminSettings();
 }

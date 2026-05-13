@@ -115,6 +115,28 @@ vi.mock('../repositories/candles.js', () => ({
         )
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
     },
+    async findCountbackCandles(params: {
+      chain: string;
+      pairAddress: string;
+      timeframe: string;
+      currency: string;
+      to: Date;
+      countBack: number;
+    }) {
+      return state.candles
+        .filter(
+          (candle) =>
+            candle.chain === params.chain &&
+            candle.pairAddress === params.pairAddress &&
+            candle.timeframe === params.timeframe &&
+            candle.currency === params.currency &&
+            candle.timestamp <= params.to &&
+            Number(candle.volume ?? 0) > 0
+        )
+        .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
+        .slice(0, params.countBack)
+        .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+    },
     async upsertCandles(params: {
       chain: string;
       pairAddress: string;
@@ -605,6 +627,169 @@ describe('chart API E2E', () => {
     expect(state.moralisCalls).toBe(1);
     expect(state.providerUsage).toHaveLength(1);
     expect(state.backfillJobs).toHaveLength(0);
+
+    await app.close();
+  });
+
+  it('serves countback OHLC from cached candles without range probing or Moralis spend', async () => {
+    const { buildServer } = await import('../server.js');
+    const app = await buildServer();
+
+    const createKeyResponse = await app.inject({
+      method: 'POST',
+      url: '/api/admin/api-keys',
+      headers: {
+        authorization: 'Bearer test-admin-key',
+      },
+      payload: {
+        name: 'countback requester',
+      },
+    });
+    const createdKey = createKeyResponse.json<{ apiKey: string }>();
+    const pairAddress = '0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640';
+
+    state.candles.push(
+      {
+        chain: 'base',
+        pairAddress,
+        timeframe: '1h',
+        currency: 'usd',
+        timestamp: new Date('2026-04-27T23:00:00.000Z'),
+        open: '0.8',
+        high: '1.1',
+        low: '0.7',
+        close: '1',
+        volume: '0',
+        trades: 0,
+      },
+      {
+        chain: 'base',
+        pairAddress,
+        timeframe: '1h',
+        currency: 'usd',
+        timestamp: new Date('2026-04-28T00:00:00.000Z'),
+        open: '1',
+        high: '2',
+        low: '0.9',
+        close: '1.5',
+        volume: '100',
+        trades: 10,
+      },
+      {
+        chain: 'base',
+        pairAddress,
+        timeframe: '1h',
+        currency: 'usd',
+        timestamp: new Date('2026-04-28T01:00:00.000Z'),
+        open: '1.5',
+        high: '2.5',
+        low: '1.4',
+        close: '2',
+        volume: '150',
+        trades: 12,
+      },
+      {
+        chain: 'base',
+        pairAddress,
+        timeframe: '1h',
+        currency: 'usd',
+        timestamp: new Date('2026-04-28T02:00:00.000Z'),
+        open: '2',
+        high: '3',
+        low: '1.8',
+        close: '2.7',
+        volume: '175',
+        trades: 14,
+      }
+    );
+
+    const response = await app.inject({
+      method: 'GET',
+      url:
+        '/api/token/ohlc/countback?' +
+        new URLSearchParams({
+          chainId: '0x2105',
+          pairAddress,
+          resolution: '60',
+          to: String(new Date('2026-04-28T02:30:00.000Z').getTime() / 1000),
+          countBack: '2',
+        }).toString(),
+      headers: {
+        'x-api-key': createdKey.apiKey,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['x-cache-source']).toBe('cache');
+    expect(response.headers['x-effective-limit']).toBe('2');
+    expect(response.headers['x-countback-returned']).toBe('2');
+    expect(response.headers['x-moralis-cu-used']).toBe('0');
+
+    const body = response.json<{
+      s: string;
+      t: number[];
+      c: number[];
+      result: Array<{ timestamp: string; close: number }>;
+    }>();
+    expect(body.s).toBe('ok');
+    expect(body.t).toEqual([1777338000, 1777341600]);
+    expect(body.c).toEqual([2, 2.7]);
+    expect(body.result).toMatchObject([
+      { timestamp: '2026-04-28T01:00:00.000Z', close: 2 },
+      { timestamp: '2026-04-28T02:00:00.000Z', close: 2.7 },
+    ]);
+    expect(state.moralisCalls).toBe(0);
+    expect(state.providerUsage).toHaveLength(0);
+    expect(state.backfillJobs).toHaveLength(0);
+
+    await app.close();
+  });
+
+  it('returns partial countback data and schedules background warmup when cache is short', async () => {
+    const { buildServer } = await import('../server.js');
+    const app = await buildServer();
+
+    const createKeyResponse = await app.inject({
+      method: 'POST',
+      url: '/api/admin/api-keys',
+      headers: {
+        authorization: 'Bearer test-admin-key',
+      },
+      payload: {
+        name: 'short countback requester',
+      },
+    });
+    const createdKey = createKeyResponse.json<{ apiKey: string }>();
+    const pairAddress = '0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640';
+
+    const response = await app.inject({
+      method: 'GET',
+      url:
+        '/api/token/ohlc/countback?' +
+        new URLSearchParams({
+          chainId: 'base',
+          pairAddress,
+          resolution: '60',
+          to: String(new Date('2026-04-28T02:30:00.000Z').getTime() / 1000),
+          countBack: '999999',
+        }).toString(),
+      headers: {
+        'x-api-key': createdKey.apiKey,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['x-cache-source']).toBe('partial');
+    expect(response.headers['x-effective-limit']).toBe('1000');
+    expect(response.headers['x-countback-returned']).toBe('0');
+    expect(response.headers['x-moralis-cu-used']).toBe('0');
+    expect(response.json<{ s: string; result: unknown[] }>()).toMatchObject({
+      s: 'no_data',
+      result: [],
+    });
+    expect(state.moralisCalls).toBe(0);
+    expect(state.providerUsage).toHaveLength(0);
+    expect(state.backfillJobs).toHaveLength(1);
 
     await app.close();
   });

@@ -167,6 +167,45 @@ export const candleRepository = {
     };
   },
 
+  async findCountbackCandles(params: {
+    chain: string;
+    pairAddress: string;
+    timeframe: OhlcvTimeframe;
+    currency: OhlcvCurrency;
+    to: Date;
+    countBack: number;
+  }) {
+    const limit = Math.max(1, Math.min(1000, params.countBack));
+    const result = await query<StoredCandle>(
+      `
+      SELECT timestamp, open, high, low, close, volume, trades
+      FROM (
+        SELECT timestamp, open, high, low, close, volume, trades
+        FROM ohlcv_candles
+        WHERE chain = $1
+          AND pair_address = $2
+          AND timeframe = $3
+          AND currency = $4
+          AND timestamp <= $5
+          AND COALESCE(volume, 0) > 0
+        ORDER BY timestamp DESC
+        LIMIT $6
+      ) latest
+      ORDER BY timestamp ASC
+      `,
+      [
+        params.chain,
+        params.pairAddress,
+        params.timeframe,
+        params.currency,
+        params.to,
+        limit,
+      ]
+    );
+
+    return result.rows;
+  },
+
   async getInventory(params?: { limit?: number | undefined }) {
     const limit = Math.max(1, Math.min(500, params?.limit ?? 100));
     const result = await query<{

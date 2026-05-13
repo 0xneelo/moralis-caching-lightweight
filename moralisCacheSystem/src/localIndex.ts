@@ -156,6 +156,15 @@ const moralisCompatQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
 });
 
+const tokenOhlcCountbackQuerySchema = z.object({
+  pairAddress: z.string().min(1),
+  chainId: z.string().min(1),
+  to: z.coerce.number().int().positive(),
+  resolution: z.string().min(1),
+  countBack: z.coerce.number().int().positive(),
+  currency: z.enum(['usd', 'native']).default(config.DEFAULT_CURRENCY),
+});
+
 const localExternalApiKey = await ensureLocalExternalApiKey();
 
 const app = Fastify({
@@ -948,6 +957,77 @@ app.get('/api/v2.2/pairs/:pairAddress/ohlcv', async (request, reply) => {
   });
 });
 
+app.get('/api/token/ohlc/countback', async (request, reply) => {
+  if (!isLocalExternalApiKeyAllowed(request.headers['x-api-key']?.toString())) {
+    return reply.status(401).send({ error: 'Invalid API key' });
+  }
+
+  const parsed = tokenOhlcCountbackQuerySchema.safeParse(request.query);
+
+  if (!parsed.success) {
+    return reply.status(400).send({
+      error: parsed.error.issues.map((issue) => issue.message).join(', '),
+    });
+  }
+
+  const chain = normalizeExternalChainId(parsed.data.chainId);
+  let timeframe: OhlcvTimeframe;
+
+  try {
+    timeframe = mapExternalResolutionToTimeframe(parsed.data.resolution);
+  } catch (error) {
+    return reply.status(400).send({
+      error: error instanceof Error ? error.message : 'Unsupported resolution',
+    });
+  }
+
+  const countBack = clampMoralisCompatLimit(parsed.data.countBack);
+  const pairAddress = normalizePairAddress(chain, parsed.data.pairAddress);
+  const to = new Date(parsed.data.to * 1000);
+  const candleKey = buildCandleKey({
+    chain,
+    pairAddress,
+    timeframe,
+    currency: parsed.data.currency,
+  });
+  const storedCandles = [...(candles.get(candleKey) ?? [])]
+    .filter((candle) => candle.time <= parsed.data.to && (candle.volume ?? 0) > 0)
+    .sort((left, right) => right.time - left.time)
+    .slice(0, countBack)
+    .sort((left, right) => left.time - right.time);
+
+  if (storedCandles.length < countBack) {
+    const from = getCountbackWarmFrom(to, timeframe, countBack);
+    const chartQuery = new URLSearchParams({
+      chain,
+      pairAddress,
+      timeframe,
+      requestedTimeframe: timeframe,
+      currency: parsed.data.currency,
+      from: from.toISOString(),
+      to: to.toISOString(),
+    });
+
+    void app.inject({
+      method: 'GET',
+      url: `/api/charts/ohlcv?${chartQuery.toString()}`,
+    }).catch(() => undefined);
+  }
+
+  setMoralisCompatHeaders(reply, {
+    source: storedCandles.length >= countBack ? 'cache' : 'partial',
+    cuUsed: 0,
+    requestedTimeframe: timeframe,
+    effectiveTimeframe: timeframe,
+    effectiveLimit: countBack,
+    pageFrom: storedCandles[0] ? new Date(storedCandles[0].timestamp) : null,
+    pageTo: to,
+  });
+  reply.header('x-countback-returned', String(storedCandles.length));
+
+  return toTokenOhlcCountbackBody(storedCandles);
+});
+
 app.get('/token/mainnet/pairs/:pairAddress/ohlcv', async (request, reply) => {
   if (!isLocalExternalApiKeyAllowed(request.headers['x-api-key']?.toString())) {
     return reply.status(401).send({ error: 'Invalid API key' });
@@ -1140,6 +1220,68 @@ function setMoralisCompatHeaders(
   reply.header('x-effective-limit', String(params.effectiveLimit));
   reply.header('x-page-from', params.pageFrom?.toISOString() ?? '');
   reply.header('x-page-to', params.pageTo?.toISOString() ?? '');
+}
+
+function toTokenOhlcCountbackBody(storedCandles: ChartCandle[]) {
+  return {
+    s: storedCandles.length > 0 ? 'ok' : 'no_data',
+    t: storedCandles.map((candle) => candle.time),
+    o: storedCandles.map((candle) => candle.open),
+    h: storedCandles.map((candle) => candle.high),
+    l: storedCandles.map((candle) => candle.low),
+    c: storedCandles.map((candle) => candle.close),
+    v: storedCandles.map((candle) => candle.volume ?? 0),
+    result: storedCandles.map(toMoralisCompatCandle),
+  };
+}
+
+function normalizeExternalChainId(chainId: string) {
+  const normalized = chainId.trim().toLowerCase();
+
+  if (normalized === '8453' || normalized === '0x2105') {
+    return 'base';
+  }
+
+  if (normalized === '1' || normalized === '0x1') {
+    return 'eth';
+  }
+
+  return normalized;
+}
+
+function mapExternalResolutionToTimeframe(resolution: string): OhlcvTimeframe {
+  const normalized = resolution.trim().toLowerCase();
+  const timeframeByResolution: Record<string, OhlcvTimeframe> = {
+    '1': '1min',
+    '5': '5min',
+    '10': '10min',
+    '30': '30min',
+    '60': '1h',
+    '240': '4h',
+    '360': '6h',
+    '720': '12h',
+    '1d': '1d',
+    d: '1d',
+    '1w': '1w',
+    w: '1w',
+    '1m': '1M',
+    m: '1M',
+  };
+
+  const timeframe = timeframeByResolution[normalized];
+
+  if (!timeframe) {
+    throw new Error(`Unsupported resolution: ${resolution}`);
+  }
+
+  return timeframe;
+}
+
+function getCountbackWarmFrom(to: Date, timeframe: OhlcvTimeframe, countBack: number) {
+  const timeframeMs = timeframeSeconds[timeframe] * 1000;
+  const overscan = Math.max(countBack * 3, countBack + 100);
+
+  return new Date(to.getTime() - timeframeMs * overscan);
 }
 
 function assertLocalAdmin(authorization: string | undefined) {
