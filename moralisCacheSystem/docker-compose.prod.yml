@@ -1,0 +1,89 @@
+x-app: &app
+  build: .
+  image: moralis-cache-system:${APP_IMAGE_TAG:-latest}
+  env_file: .env
+  environment: &app-env
+    NODE_ENV: production
+    DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/moralis_cache
+    REDIS_URL: redis://redis:6379
+    LOG_FILE: /app/logs/app.log
+    MORALIS_LOG_FILE: /app/logs/moralis.log
+    INTERACTION_LOG_FILE: /app/logs/interactions.log
+    INTERACTION_LOG_DIR: /app/logs/interactions
+  volumes:
+    - app_logs:/app/logs
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: moralis_cache
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d moralis_cache"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    <<: *app
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["node", "dist/scripts/migrate.js"]
+
+  api:
+    <<: *app
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      PORT: 3001
+    ports:
+      - "${API_PUBLIC_PORT:-3001}:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  worker:
+    <<: *app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: ["node", "dist/worker.js"]
+
+volumes:
+  postgres_data:
+  redis_data:
+  app_logs:

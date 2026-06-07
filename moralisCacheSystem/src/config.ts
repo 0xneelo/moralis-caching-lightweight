@@ -30,6 +30,19 @@ const configSchema = z.object({
 
 export const config = configSchema.parse(process.env);
 
+if (config.NODE_ENV === 'production') {
+  const missingProductionSecrets = [
+    ['MORALIS_API_KEY', config.MORALIS_API_KEY],
+    ['ADMIN_API_KEY', config.ADMIN_API_KEY],
+  ]
+    .filter(([, value]) => !value)
+    .map(([name]) => name);
+
+  if (missingProductionSecrets.length > 0) {
+    throw new Error(`Missing required production env vars: ${missingProductionSecrets.join(', ')}`);
+  }
+}
+
 export type AppConfig = typeof config;
 
 function loadRawMoralisKeyIfPresent() {

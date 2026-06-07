@@ -1,3 +1,4 @@
+.DS_Store
 node_modules/
 dist/
 coverage/
@@ -5,6 +6,8 @@ logs/
 .env
 .env.*
 !.env.example
+!.env.production.example
+!moralisCacheSystem/.env.production.example
 moralisCacheSystem/.local-external-api-key
 moralisCacheSystem/.local-proxy-usage.json
 moralisCacheSystem/.local-proxy-usage.jsonl

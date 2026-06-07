@@ -325,11 +325,88 @@ Queue active pair refresh jobs:
 npm run schedule
 ```
 
+## Production Deployment
+
+The production deployment is server-agnostic. It assumes a Linux server with SSH access, Git, Docker Engine, and the Docker Compose plugin. The bootstrap script can install Git and Docker automatically on Ubuntu/Debian servers.
+
+### Fresh Server Bootstrap
+
+Run this on the server:
+
+```bash
+REPO_URL=https://github.com/0xneelo/moralis-caching-lightweight.git \
+BRANCH=main \
+APP_DIR=/opt/moralis-caching-lightweight \
+MORALIS_API_KEY=your-moralis-key \
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/0xneelo/moralis-caching-lightweight/main/moralisCacheSystem/scripts/bootstrap-server.sh)"
+```
+
+If `MORALIS_API_KEY` is not provided, the script creates `.env` with a placeholder. Edit it before deploying:
+
+```bash
+nano /opt/moralis-caching-lightweight/moralisCacheSystem/.env
+```
+
+Then deploy:
+
+```bash
+cd /opt/moralis-caching-lightweight/moralisCacheSystem
+./scripts/deploy.sh
+```
+
+### Existing Server Deploy
+
+After the repo is cloned and `.env` exists, deploy from any server with:
+
+```bash
+cd /opt/moralis-caching-lightweight/moralisCacheSystem
+DEPLOY_REF=main ./scripts/deploy.sh
+```
+
+The deploy script fetches `origin/main`, resets the working tree to that ref, validates required secrets, builds the Docker images, runs migrations, starts API and worker containers, and waits for `/health` to pass.
+
+Required production secrets:
+
+```env
+MORALIS_API_KEY=your-moralis-key
+ADMIN_API_KEY=long-random-admin-key
+POSTGRES_PASSWORD=long-random-db-password
+```
+
+Optional deployment settings:
+
+```env
+API_PUBLIC_PORT=3001
+APP_IMAGE_TAG=latest
+```
+
+`bootstrap-server.sh` generates `ADMIN_API_KEY` and `POSTGRES_PASSWORD` automatically when it creates `.env`.
+
+For private GitHub repos, prefer a read-only deploy key on the server:
+
+```bash
+ssh-keygen -t ed25519 -C "moralis-cache-deploy" -f ~/.ssh/moralis_cache_deploy
+cat ~/.ssh/moralis_cache_deploy.pub
+```
+
+Add the public key in GitHub as a repository deploy key with read-only access. Then clone with the SSH URL and set `REPO_URL` accordingly.
+
+### Production Compose Services
+
+`docker-compose.prod.yml` starts:
+
+- `postgres`: TimescaleDB/Postgres with a persistent volume
+- `redis`: Redis with append-only persistence
+- `migrate`: one-shot migration job
+- `api`: public HTTP API on `API_PUBLIC_PORT` (defaults to `3001`)
+- `worker`: BullMQ backfill worker
+
+Postgres and Redis are not exposed publicly in the production compose file.
+
 ## Production Notes
 
-- Run API and worker as separate processes.
-- Put `.env` values in a real secret manager.
+- Keep `.env` on the server only. Never commit it.
 - Keep `ADMIN_API_KEY` private.
-- Use HTTPS and normal auth in front of admin routes.
+- Use HTTPS and normal auth in front of admin routes when exposing this beyond trusted clients.
 - Set dashboard alerts on `provider_api_usage.estimated_cu`.
 - Keep Dexscreener fallback available until this service is proven stable.
