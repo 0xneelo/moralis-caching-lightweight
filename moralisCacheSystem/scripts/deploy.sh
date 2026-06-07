@@ -41,6 +41,7 @@ validate_env() {
       exit 2
     fi
   done
+
 }
 
 update_repo() {

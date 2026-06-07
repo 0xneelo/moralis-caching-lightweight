@@ -1,6 +1,10 @@
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
+import fastifyStatic from '@fastify/static';
 import Fastify from 'fastify';
+import type { FastifyInstance } from 'fastify';
+import fs from 'node:fs';
+import path from 'node:path';
 import { config } from './config.js';
 import { HttpError } from './httpErrors.js';
 import { registerAdminRoutes } from './routes/adminRoutes.js';
@@ -46,6 +50,7 @@ export async function buildServer() {
   await registerUsageRoutes(app);
   await registerInteractionRoutes(app);
   await registerAdminRoutes(app);
+  await registerStaticDashboard(app);
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof HttpError) {
@@ -62,4 +67,22 @@ export async function buildServer() {
   });
 
   return app;
+}
+
+async function registerStaticDashboard(app: FastifyInstance) {
+  const staticRoot = path.resolve(process.cwd(), 'client/dist');
+  const indexPath = path.join(staticRoot, 'index.html');
+
+  if (!fs.existsSync(indexPath)) {
+    return;
+  }
+
+  await app.register(fastifyStatic, {
+    root: staticRoot,
+    prefix: '/',
+    wildcard: false,
+  });
+
+  app.get('/admin', async (_request, reply) => reply.sendFile('index.html'));
+  app.get('/admin/*', async (_request, reply) => reply.sendFile('index.html'));
 }

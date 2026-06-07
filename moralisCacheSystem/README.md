@@ -398,15 +398,15 @@ Add the public key in GitHub as a repository deploy key with read-only access. T
 - `postgres`: TimescaleDB/Postgres with a persistent volume
 - `redis`: Redis with append-only persistence
 - `migrate`: one-shot migration job
-- `api`: public HTTP API on `API_PUBLIC_PORT` (defaults to `3001`)
+- `api`: public HTTP API and static dashboard on `API_PUBLIC_PORT` (defaults to `3001`)
 - `worker`: BullMQ backfill worker
 
-Postgres and Redis are not exposed publicly in the production compose file.
+Postgres and Redis are not exposed publicly in the production compose file. The dashboard is served by the API container from the built `client/dist` assets.
 
 ## Production Notes
 
 - Keep `.env` on the server only. Never commit it.
 - Keep `ADMIN_API_KEY` private.
-- Use HTTPS and normal auth in front of admin routes when exposing this beyond trusted clients.
+- Use normal auth in front of admin routes when exposing this beyond trusted clients.
 - Set dashboard alerts on `provider_api_usage.estimated_cu`.
 - Keep Dexscreener fallback available until this service is proven stable.
