@@ -34,9 +34,12 @@
     "dotenv": "^17.2.3",
     "fastify": "^5.6.2",
     "ioredis": "^5.8.2",
+    "lightweight-charts": "^5.2.0",
     "pg": "^8.16.3",
     "pino": "^10.1.0",
     "pino-pretty": "^13.1.2",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
     "zod": "^4.1.13"
   },
   "devDependencies": {
