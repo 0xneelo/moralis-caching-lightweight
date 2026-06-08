@@ -37,6 +37,29 @@ export function findMissingRanges(params: {
   return mergeNearbyRanges(gaps, stepMs);
 }
 
+export function prioritizeVisibleRanges(
+  ranges: TimeRange[],
+  visibleRange: TimeRange
+) {
+  return [...ranges].sort((left, right) => {
+    const leftVisible = rangesOverlap(left, visibleRange);
+    const rightVisible = rangesOverlap(right, visibleRange);
+
+    if (leftVisible !== rightVisible) {
+      return leftVisible ? -1 : 1;
+    }
+
+    if (leftVisible && rightVisible) {
+      const newestFirst = right.to.getTime() - left.to.getTime();
+      if (newestFirst !== 0) {
+        return newestFirst;
+      }
+    }
+
+    return distanceToRange(left, visibleRange) - distanceToRange(right, visibleRange);
+  });
+}
+
 function mergeNearbyRanges(ranges: TimeRange[], stepMs: number): TimeRange[] {
   const merged: TimeRange[] = [];
 
@@ -51,4 +74,20 @@ function mergeNearbyRanges(ranges: TimeRange[], stepMs: number): TimeRange[] {
   }
 
   return merged;
+}
+
+function rangesOverlap(left: TimeRange, right: TimeRange) {
+  return left.from < right.to && left.to > right.from;
+}
+
+function distanceToRange(range: TimeRange, target: TimeRange) {
+  if (rangesOverlap(range, target)) {
+    return 0;
+  }
+
+  if (range.to <= target.from) {
+    return target.from.getTime() - range.to.getTime();
+  }
+
+  return range.from.getTime() - target.to.getTime();
 }

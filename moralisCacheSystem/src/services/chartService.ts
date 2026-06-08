@@ -1,7 +1,7 @@
 import { buildChartCacheKey, getChartCacheTtl, getJsonCache, setJsonCache } from '../cache.js';
 import { findSuspiciousOhlcRanges, normalizeCandleOhlc } from '../candleQuality.js';
 import { getAdminSettings } from '../adminConfig.js';
-import { findMissingRanges } from '../gaps.js';
+import { findMissingRanges, prioritizeVisibleRanges } from '../gaps.js';
 import { buildGapFetchLockKey, withRedisLock } from '../locks.js';
 import { fetchMoralisOhlcv } from '../moralis.js';
 import { normalizePairAddress } from '../pairAddress.js';
@@ -245,7 +245,7 @@ export async function getOhlcvForChart(params: {
     from: params.visibleFrom ?? params.from,
     to: params.visibleTo ?? params.to,
   };
-  const prioritizedGaps = prioritizeVisibleGaps(fetchRanges, visibleRange);
+  const prioritizedGaps = prioritizeVisibleRanges(fetchRanges, visibleRange);
 
   if (forceMoralisRefresh) {
     await appendInteractionTraceEvent(params.interactionId, 'manual_refresh_from_moralis_requested', {
@@ -838,34 +838,6 @@ function fillMissingChartCandles(
   return result;
 }
 
-function prioritizeVisibleGaps(
-  gaps: Array<{ from: Date; to: Date }>,
-  visibleRange: { from: Date; to: Date }
-) {
-  return [...gaps].sort((left, right) => {
-    const leftVisible = rangesOverlap(left, visibleRange);
-    const rightVisible = rangesOverlap(right, visibleRange);
-
-    if (leftVisible !== rightVisible) {
-      return leftVisible ? -1 : 1;
-    }
-
-    return distanceToRange(left, visibleRange) - distanceToRange(right, visibleRange);
-  });
-}
-
 function rangesOverlap(left: { from: Date; to: Date }, right: { from: Date; to: Date }) {
   return left.from < right.to && left.to > right.from;
-}
-
-function distanceToRange(range: { from: Date; to: Date }, target: { from: Date; to: Date }) {
-  if (rangesOverlap(range, target)) {
-    return 0;
-  }
-
-  if (range.to <= target.from) {
-    return target.from.getTime() - range.to.getTime();
-  }
-
-  return range.from.getTime() - target.to.getTime();
 }
