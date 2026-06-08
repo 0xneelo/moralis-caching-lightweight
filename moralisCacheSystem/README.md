@@ -280,13 +280,13 @@ Authorization: Bearer change-me
 
 ## Cost Controls
 
-- Max synchronous Moralis pages defaults to `3`.
+- Max synchronous Moralis pages defaults to `8`.
 - Large gaps are queued instead of fetched synchronously.
 - Redis locks dedupe concurrent provider fetches.
 - Chart requests are rate-limited by user/IP.
 - Provider cache misses are rate-limited separately.
 - Estimated Moralis CUs are logged in `provider_api_usage`.
-- Daily CU budget guard defaults to `5,000,000`.
+- Daily CU budget guard defaults to `3,000,000`.
 
 ## Useful Commands
 
