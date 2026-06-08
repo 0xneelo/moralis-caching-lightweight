@@ -286,7 +286,7 @@ Authorization: Bearer change-me
 - Chart requests are rate-limited by user/IP.
 - Provider cache misses are rate-limited separately.
 - Estimated Moralis CUs are logged in `provider_api_usage`.
-- Daily CU budget guard defaults to `3,000,000`.
+- Daily CU budget guard defaults to `3,333,333`.
 
 ## Useful Commands
 
