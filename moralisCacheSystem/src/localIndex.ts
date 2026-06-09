@@ -62,7 +62,7 @@ let persistentCacheInventorySnapshot: Array<{
 let persistentCacheSnapshotLoaded = false;
 
 type MoralisCompatCursor = {
-  fromDate: string;
+  beforeDate: string;
   effectiveTimeframe: OhlcvTimeframe;
 };
 
@@ -946,7 +946,7 @@ app.get('/api/v2.2/pairs/:pairAddress/ohlcv', async (request, reply) => {
 
   return injectMoralisCompatOhlcv({
     reply,
-    chain: parsedQuery.data.chain ?? 'eth',
+    chain: normalizeExternalChainId(parsedQuery.data.chain ?? 'eth'),
     pairAddress: parsedParams.data.pairAddress,
     timeframe: parsedQuery.data.timeframe,
     currency: parsedQuery.data.currency,
@@ -1089,29 +1089,25 @@ async function injectMoralisCompatOhlcv(params: {
 }) {
   const requestedFrom = new Date(params.fromDate);
   const requestedTo = new Date(params.toDate);
-  const effectiveTimeframe = getEffectiveAdaptiveTimeframe({
-    requestedTimeframe: params.timeframe,
-    from: requestedFrom,
-    to: requestedTo,
-  });
+  const effectiveTimeframe = params.timeframe;
   const effectiveLimit = clampMoralisCompatLimit(params.requestedLimit);
-  let pageWindow: ReturnType<typeof getPageWindow>;
+  let cursor: MoralisCompatCursor | null;
 
   try {
-    pageWindow = getPageWindow({
-      cursor: params.cursor,
-      fromDate: params.fromDate,
-      toDate: params.toDate,
-      timeframe: effectiveTimeframe,
-      limit: effectiveLimit,
-    });
+    cursor = decodeCursor(params.cursor);
   } catch (error) {
     return params.reply.status(400).send({
       error: error instanceof Error ? error.message : 'Invalid request',
     });
   }
 
-  if (!pageWindow) {
+  if (cursor && cursor.effectiveTimeframe !== effectiveTimeframe) {
+    return params.reply.status(400).send({ error: 'Invalid cursor' });
+  }
+
+  const pageBefore = cursor ? new Date(cursor.beforeDate) : requestedTo;
+
+  if (pageBefore <= requestedFrom) {
     setMoralisCompatHeaders(params.reply, {
       source: 'cache',
       cuUsed: 0,
@@ -1129,44 +1125,78 @@ async function injectMoralisCompatOhlcv(params: {
   }
 
   const beforeCu = usage.totalCu;
-  const chartQuery = new URLSearchParams({
+  const normalizedPairAddress = normalizePairAddress(params.chain, params.pairAddress);
+  const candleKey = buildCandleKey({
     chain: params.chain,
-    pairAddress: params.pairAddress,
+    pairAddress: normalizedPairAddress,
     timeframe: effectiveTimeframe,
-    requestedTimeframe: params.timeframe,
     currency: params.currency,
-    from: pageWindow.from.toISOString(),
-    to: pageWindow.to.toISOString(),
   });
-  const chartResponse = await app.inject({
-    method: 'GET',
-    url: `/api/charts/ohlcv?${chartQuery.toString()}`,
-  });
+  let pageCandles = [...(candles.get(candleKey) ?? [])]
+    .filter((candle) => {
+      const timestamp = new Date(candle.timestamp);
+      return timestamp >= requestedFrom && timestamp <= requestedTo && (!cursor || timestamp < pageBefore);
+    })
+    .sort((left, right) => right.time - left.time)
+    .slice(0, effectiveLimit + 1);
+  let source = 'cache';
+  let providerTruncated = false;
 
-  if (chartResponse.statusCode !== 200) {
-    params.reply.status(chartResponse.statusCode);
-    return chartResponse.json();
+  if (pageCandles.length <= effectiveLimit && config.MORALIS_API_KEY) {
+    const providerResult = await fetchMoralisOhlcvLocal({
+      chain: params.chain,
+      pairAddress: normalizedPairAddress,
+      timeframe: effectiveTimeframe,
+      currency: params.currency,
+      from: requestedFrom,
+      to: pageBefore,
+      maxPages: 1,
+    });
+    providerTruncated = providerResult.truncated;
+    source = 'cache+moralis';
+    const fetchedCandles = providerResult.candles.map(toChartCandle);
+    candles.set(candleKey, mergeCandles(candles.get(candleKey) ?? [], fetchedCandles));
+    await recordMoralisUsage({
+      chain: params.chain,
+      pairAddress: normalizedPairAddress,
+      timeframe: effectiveTimeframe,
+      currency: params.currency,
+      requestFrom: requestedFrom,
+      requestTo: pageBefore,
+      pages: providerResult.pages,
+      returnedCandles: providerResult.candles.length,
+    });
+    pageCandles = [...(candles.get(candleKey) ?? [])]
+      .filter((candle) => {
+        const timestamp = new Date(candle.timestamp);
+        return timestamp >= requestedFrom && timestamp <= requestedTo && (!cursor || timestamp < pageBefore);
+      })
+      .sort((left, right) => right.time - left.time)
+      .slice(0, effectiveLimit + 1);
   }
 
-  const body = chartResponse.json<{ source: string; candles: ChartCandle[] }>();
-  const result = body.candles.slice(0, effectiveLimit).map(toMoralisCompatCandle);
   const cuDelta = usage.totalCu - beforeCu;
-  const cursor =
-    pageWindow.nextFrom && pageWindow.nextFrom < pageWindow.requestedTo
-      ? encodeCursor({
-          fromDate: pageWindow.nextFrom.toISOString(),
-          effectiveTimeframe,
-        })
-      : null;
+  const selectedCandles = pageCandles.slice(0, effectiveLimit);
+  const result = selectedCandles.map(toMoralisCompatCandle);
+  const nextCursor = (providerTruncated || pageCandles.length > effectiveLimit) && selectedCandles.length > 0
+    ? encodeCursor({
+        beforeDate: selectedCandles[selectedCandles.length - 1]!.timestamp,
+        effectiveTimeframe,
+      })
+    : null;
+  const newestReturned = selectedCandles[0] ? new Date(selectedCandles[0].timestamp) : null;
+  const oldestReturned = selectedCandles[selectedCandles.length - 1]
+    ? new Date(selectedCandles[selectedCandles.length - 1]!.timestamp)
+    : null;
 
   setMoralisCompatHeaders(params.reply, {
-    source: body.source,
+    source,
     cuUsed: cuDelta,
     requestedTimeframe: params.timeframe,
     effectiveTimeframe,
     effectiveLimit,
-    pageFrom: pageWindow.from,
-    pageTo: pageWindow.to,
+    pageFrom: oldestReturned,
+    pageTo: newestReturned,
   });
 
   logger.info(
@@ -1176,18 +1206,18 @@ async function injectMoralisCompatOhlcv(params: {
       pairAddress: params.pairAddress,
       requestedTimeframe: params.timeframe,
       effectiveTimeframe,
-      source: body.source,
+      source,
       returnedCandles: result.length,
       estimatedCu: cuDelta,
-      nextCursor: Boolean(cursor),
-      from: pageWindow.from.toISOString(),
-      to: pageWindow.to.toISOString(),
+      nextCursor: Boolean(nextCursor),
+      from: requestedFrom.toISOString(),
+      to: requestedTo.toISOString(),
     },
     'Served Moralis-compatible OHLCV request'
   );
 
   return {
-    cursor,
+    cursor: nextCursor,
     result,
   };
 }
@@ -2231,6 +2261,7 @@ async function fetchMoralisOhlcvLocal(params: {
   return {
     candles: result,
     pages,
+    truncated: Boolean(cursor),
   };
 }
 
@@ -2556,43 +2587,6 @@ function isLocalExternalApiKeyAllowed(apiKey: string | undefined) {
   return Boolean(apiKey) && apiKey === localExternalApiKey;
 }
 
-function getPageWindow(params: {
-  cursor?: string | undefined;
-  fromDate: string;
-  toDate: string;
-  timeframe: OhlcvTimeframe;
-  limit: number;
-}) {
-  const requestedFrom = new Date(params.fromDate);
-  const requestedTo = new Date(params.toDate);
-  const cursor = decodeCursor(params.cursor);
-
-  if (cursor && cursor.effectiveTimeframe !== params.timeframe) {
-    throw new Error('Invalid cursor');
-  }
-
-  const from = cursor ? new Date(cursor.fromDate) : requestedFrom;
-
-  if (requestedTo <= requestedFrom) {
-    throw new Error('Invalid chart range');
-  }
-
-  if (from >= requestedTo) {
-    return null;
-  }
-
-  const stepMs = timeframeSeconds[params.timeframe] * 1000;
-  const nextFrom = new Date(from.getTime() + params.limit * stepMs);
-  const pageTo = new Date(Math.min(requestedTo.getTime(), nextFrom.getTime()));
-
-  return {
-    from,
-    to: pageTo,
-    requestedTo,
-    nextFrom,
-  };
-}
-
 function encodeCursor(cursor: MoralisCompatCursor) {
   return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
 }
@@ -2608,12 +2602,12 @@ function decodeCursor(cursor: string | undefined) {
     ) as MoralisCompatCursor;
 
     if (
-      typeof parsed.fromDate !== 'string' ||
-      Number.isNaN(new Date(parsed.fromDate).getTime()) ||
+      typeof parsed.beforeDate !== 'string' ||
+      Number.isNaN(new Date(parsed.beforeDate).getTime()) ||
       typeof parsed.effectiveTimeframe !== 'string' ||
       !isOhlcvTimeframe(parsed.effectiveTimeframe)
     ) {
-      throw new Error('Invalid cursor fromDate');
+      throw new Error('Invalid cursor beforeDate');
     }
 
     return parsed;

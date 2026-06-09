@@ -5,13 +5,12 @@ import { getChartCacheTtl, getJsonCache, setJsonCache } from '../cache.js';
 import { config } from '../config.js';
 import { badRequest } from '../httpErrors.js';
 import { enqueueBackfillJob } from '../jobs/enqueue.js';
+import { fetchMoralisOhlcv } from '../moralis.js';
 import { normalizePairAddress } from '../pairAddress.js';
 import { enforceExternalApiKeyRequestRateLimit } from '../rateLimit.js';
 import { candleRepository } from '../repositories/candles.js';
 import { providerUsageRepository } from '../repositories/providerUsage.js';
-import { getOhlcvForChart } from '../services/chartService.js';
 import {
-  getEffectiveAdaptiveTimeframe,
   isOhlcvTimeframe,
   maxSyncCandlesByTimeframe,
   timeframeSeconds,
@@ -55,7 +54,7 @@ type TokenOhlcResult = {
 };
 
 type MoralisCompatCursor = {
-  fromDate: string;
+  beforeDate: string;
   effectiveTimeframe: OhlcvTimeframe;
 };
 
@@ -155,7 +154,7 @@ export async function registerMoralisCompatRoutes(app: FastifyInstance) {
     reply.header('Cache-Control', 'private, max-age=5');
 
     const result = await getMoralisOhlcvResponse({
-      chain: parsed.data.chain ?? 'eth',
+      chain: normalizeChainId(parsed.data.chain ?? 'eth'),
       pairAddress,
       timeframe: parsed.data.timeframe,
       currency: (parsed.data.currency ?? config.DEFAULT_CURRENCY) as OhlcvCurrency,
@@ -350,21 +349,17 @@ async function getMoralisOhlcvResponse(params: {
     throw badRequest('Invalid chart range');
   }
 
-  const effectiveTimeframe = getEffectiveAdaptiveTimeframe({
-    requestedTimeframe: params.timeframe,
-    from: requestedFrom,
-    to: requestedTo,
-  });
+  const effectiveTimeframe = params.timeframe;
   const effectiveLimit = clampLimit(effectiveTimeframe, params.requestedLimit);
-  const pageWindow = getPageWindow({
-    cursor: params.cursor,
-    fromDate: params.fromDate,
-    toDate: params.toDate,
-    timeframe: effectiveTimeframe,
-    limit: effectiveLimit,
-  });
+  const cursor = decodeCursor(params.cursor);
 
-  if (!pageWindow) {
+  if (cursor && cursor.effectiveTimeframe !== effectiveTimeframe) {
+    throw badRequest('Invalid cursor');
+  }
+
+  const pageBefore = cursor ? new Date(cursor.beforeDate) : requestedTo;
+
+  if (pageBefore <= requestedFrom) {
     return {
       body: {
         cursor: null,
@@ -388,8 +383,8 @@ async function getMoralisOhlcvResponse(params: {
     requestedTimeframe: params.timeframe,
     effectiveTimeframe,
     currency: params.currency,
-    from: pageWindow.from,
-    to: pageWindow.to,
+    from: requestedFrom,
+    to: pageBefore,
     limit: effectiveLimit,
   });
   const cachedResponse = await getJsonCache<MoralisCompatResult>(compatCacheKey);
@@ -397,45 +392,95 @@ async function getMoralisOhlcvResponse(params: {
     return cachedResponse;
   }
 
-  const cuBefore = await getExternalApiKeyCuUsedToday(params.externalApiKeyId);
-  const chartResponse = await getOhlcvForChart({
+  const pairAddress = normalizePairAddress(params.chain, params.pairAddress);
+  let pageCandles = await candleRepository.findCandlesPageDesc({
     chain: params.chain,
-    pairAddress: params.pairAddress,
+    pairAddress,
     timeframe: effectiveTimeframe,
-    requestedTimeframe: params.timeframe,
     currency: params.currency,
-    from: pageWindow.from,
-    to: pageWindow.to,
-    userId: params.userId,
-    ip: params.ip,
-    externalApiKeyId: params.externalApiKeyId,
-    maxProviderPages: 1,
-    maxProviderFetches: 1,
+    from: requestedFrom,
+    to: requestedTo,
+    before: cursor ? pageBefore : undefined,
+    limit: effectiveLimit + 1,
   });
-  const cuAfter = await getExternalApiKeyCuUsedToday(params.externalApiKeyId);
 
-  const result = chartResponse.candles.slice(0, effectiveLimit).map(toMoralisCandle);
-  const cursor =
-    pageWindow.nextFrom && pageWindow.nextFrom < pageWindow.requestedTo
-      ? encodeCursor({
-          fromDate: pageWindow.nextFrom.toISOString(),
-          effectiveTimeframe,
-        })
-      : null;
+  let source = 'cache';
+  let cuUsed = 0;
+  let providerTruncated = false;
+
+  if (pageCandles.length <= effectiveLimit) {
+    const providerResult = await fetchMoralisOhlcv({
+      chain: params.chain,
+      pairAddress,
+      timeframe: effectiveTimeframe,
+      currency: params.currency,
+      fromDate: requestedFrom,
+      toDate: pageBefore,
+      maxPages: 1,
+    });
+    providerTruncated = providerResult.truncated;
+    source = 'cache+moralis';
+    cuUsed = providerResult.estimatedCu;
+
+    await candleRepository.upsertCandles({
+      chain: params.chain,
+      pairAddress,
+      timeframe: effectiveTimeframe,
+      currency: params.currency,
+      candles: providerResult.candles,
+    });
+
+    await providerUsageRepository.log({
+      provider: 'moralis',
+      endpoint: 'getPairCandlesticks',
+      externalApiKeyId: params.externalApiKeyId,
+      chain: params.chain,
+      pairAddress,
+      timeframe: effectiveTimeframe,
+      requestFrom: requestedFrom,
+      requestTo: pageBefore,
+      httpStatus: 200,
+      estimatedCu: providerResult.estimatedCu,
+      pages: providerResult.pages,
+      durationMs: providerResult.durationMs,
+    });
+
+    pageCandles = await candleRepository.findCandlesPageDesc({
+      chain: params.chain,
+      pairAddress,
+      timeframe: effectiveTimeframe,
+      currency: params.currency,
+      from: requestedFrom,
+      to: requestedTo,
+      before: cursor ? pageBefore : undefined,
+      limit: effectiveLimit + 1,
+    });
+  }
+
+  const selectedCandles = pageCandles.slice(0, effectiveLimit);
+  const result = selectedCandles.map(toMoralisCandle);
+  const nextCursor = (providerTruncated || pageCandles.length > effectiveLimit) && selectedCandles.length > 0
+    ? encodeCursor({
+        beforeDate: selectedCandles[selectedCandles.length - 1]!.timestamp.toISOString(),
+        effectiveTimeframe,
+      })
+    : null;
+  const newestReturned = selectedCandles[0]?.timestamp ?? null;
+  const oldestReturned = selectedCandles[selectedCandles.length - 1]?.timestamp ?? null;
 
   const response = {
     body: {
-      cursor,
+      cursor: nextCursor,
       result,
     },
     headers: buildCompatibilityHeaders({
-      source: chartResponse.source,
-      cuUsed: Math.max(0, cuAfter - cuBefore),
+      source,
+      cuUsed,
       requestedTimeframe: params.timeframe,
       effectiveTimeframe,
       effectiveLimit,
-      pageFrom: pageWindow.from,
-      pageTo: pageWindow.to,
+      pageFrom: oldestReturned,
+      pageTo: newestReturned,
     }),
   };
 
@@ -561,43 +606,6 @@ function warmExternalCacheInBackground(params: {
   }).catch(() => undefined);
 }
 
-function getPageWindow(params: {
-  cursor?: string | undefined;
-  fromDate: string;
-  toDate: string;
-  timeframe: OhlcvTimeframe;
-  limit: number;
-}) {
-  const requestedFrom = new Date(params.fromDate);
-  const requestedTo = new Date(params.toDate);
-  const cursor = decodeCursor(params.cursor);
-
-  if (cursor && cursor.effectiveTimeframe !== params.timeframe) {
-    throw badRequest('Invalid cursor');
-  }
-
-  const from = cursor ? new Date(cursor.fromDate) : requestedFrom;
-
-  if (requestedTo <= requestedFrom) {
-    throw badRequest('Invalid chart range');
-  }
-
-  if (from >= requestedTo) {
-    return null;
-  }
-
-  const stepMs = timeframeSeconds[params.timeframe] * 1000;
-  const nextFrom = new Date(from.getTime() + params.limit * stepMs);
-  const pageTo = new Date(Math.min(requestedTo.getTime(), nextFrom.getTime()));
-
-  return {
-    from,
-    to: pageTo,
-    requestedTo,
-    nextFrom,
-  };
-}
-
 function decodeCursor(cursor: string | undefined) {
   if (!cursor) {
     return null;
@@ -609,12 +617,12 @@ function decodeCursor(cursor: string | undefined) {
     ) as MoralisCompatCursor;
 
     if (
-      typeof parsed.fromDate !== 'string' ||
-      Number.isNaN(new Date(parsed.fromDate).getTime()) ||
+      typeof parsed.beforeDate !== 'string' ||
+      Number.isNaN(new Date(parsed.beforeDate).getTime()) ||
       typeof parsed.effectiveTimeframe !== 'string' ||
       !isOhlcvTimeframe(parsed.effectiveTimeframe)
     ) {
-      throw new Error('Invalid cursor fromDate');
+      throw new Error('Invalid cursor beforeDate');
     }
 
     return parsed;
@@ -681,7 +689,7 @@ function buildMoralisCompatCacheKey(params: {
 }) {
   return [
     'moralis-compat',
-    'v1',
+    'v3',
     params.chain,
     normalizePairAddress(params.chain, params.pairAddress),
     params.requestedTimeframe,

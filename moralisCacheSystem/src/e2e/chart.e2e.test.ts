@@ -115,6 +115,30 @@ vi.mock('../repositories/candles.js', () => ({
         )
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
     },
+    async findCandlesPageDesc(params: {
+      chain: string;
+      pairAddress: string;
+      timeframe: string;
+      currency: string;
+      from: Date;
+      to: Date;
+      before?: Date | undefined;
+      limit: number;
+    }) {
+      return state.candles
+        .filter(
+          (candle) =>
+            candle.chain === params.chain &&
+            candle.pairAddress === params.pairAddress &&
+            candle.timeframe === params.timeframe &&
+            candle.currency === params.currency &&
+            candle.timestamp >= params.from &&
+            candle.timestamp <= params.to &&
+            (!params.before || candle.timestamp < params.before)
+        )
+        .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
+        .slice(0, params.limit);
+    },
     async findCountbackCandles(params: {
       chain: string;
       pairAddress: string;
@@ -533,19 +557,19 @@ describe('chart API E2E', () => {
     expect(firstBody.cursor).toEqual(expect.any(String));
     expect(firstBody.result).toEqual([
       {
-        timestamp: '2026-04-28T00:00:00.000Z',
-        open: 1,
-        high: 2,
-        low: 0.9,
-        close: 1.5,
-        volume: 100,
-        trades: 10,
+        timestamp: '2026-04-28T01:00:00.000Z',
+        open: 1.5,
+        high: 2.5,
+        low: 1.4,
+        close: 2,
+        volume: 150,
+        trades: 12,
       },
     ]);
     expect(firstBody.result[0]?.time).toBeUndefined();
     expect(firstResponse.headers['x-cache-source']).toBe('cache+moralis');
     expect(firstResponse.headers['x-effective-limit']).toBe('1');
-    expect(firstResponse.headers['x-page-from']).toBe('2026-04-28T00:00:00.000Z');
+    expect(firstResponse.headers['x-page-from']).toBe('2026-04-28T01:00:00.000Z');
     expect(firstResponse.headers['x-page-to']).toBe('2026-04-28T01:00:00.000Z');
     expect(firstResponse.headers['x-moralis-cu-used']).toBe('150');
     expect(state.moralisCalls).toBe(1);
@@ -568,12 +592,104 @@ describe('chart API E2E', () => {
     expect(secondBody.cursor).toBeNull();
     expect(secondBody.result).toMatchObject([
       {
-        timestamp: '2026-04-28T01:00:00.000Z',
-        close: 2,
+        timestamp: '2026-04-28T00:00:00.000Z',
+        close: 1.5,
       },
     ]);
-    expect(state.moralisCalls).toBe(1);
+    expect(state.moralisCalls).toBe(2);
     expect(state.apiKeys[0]?.requestCount).toBe(2);
+
+    await app.close();
+  });
+
+  it('paginates Moralis-compatible responses by newest real candles, not dense time buckets', async () => {
+    const { buildServer } = await import('../server.js');
+    const app = await buildServer();
+
+    const createKeyResponse = await app.inject({
+      method: 'POST',
+      url: '/api/admin/api-keys',
+      headers: {
+        authorization: 'Bearer test-admin-key',
+      },
+      payload: {
+        name: 'sparse requester',
+      },
+    });
+    const createdKey = createKeyResponse.json<{ apiKey: string }>();
+    const pairAddress = '0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640';
+
+    state.candles.push(
+      {
+        chain: 'eth',
+        pairAddress,
+        timeframe: '1h',
+        currency: 'usd',
+        timestamp: new Date('2026-04-28T02:00:00.000Z'),
+        open: '2',
+        high: '2',
+        low: '2',
+        close: '2',
+        volume: '20',
+        trades: 2,
+      },
+      {
+        chain: 'eth',
+        pairAddress,
+        timeframe: '1h',
+        currency: 'usd',
+        timestamp: new Date('2026-04-28T04:00:00.000Z'),
+        open: '4',
+        high: '4',
+        low: '4',
+        close: '4',
+        volume: '40',
+        trades: 4,
+      }
+    );
+
+    const url =
+      `/api/v2.2/pairs/${pairAddress}/ohlcv?` +
+      new URLSearchParams({
+        chain: 'eth',
+        timeframe: '1h',
+        currency: 'usd',
+        fromDate: '2026-04-28T00:00:00.000Z',
+        toDate: '2026-04-28T05:00:00.000Z',
+        limit: '2',
+      }).toString();
+
+    const firstResponse = await app.inject({
+      method: 'GET',
+      url,
+      headers: {
+        'x-api-key': createdKey.apiKey,
+      },
+    });
+
+    expect(firstResponse.statusCode).toBe(200);
+    const firstBody = firstResponse.json<{ cursor: string | null; result: Array<{ timestamp: string }> }>();
+    expect(firstBody.result.map((candle) => candle.timestamp)).toEqual([
+      '2026-04-28T04:00:00.000Z',
+      '2026-04-28T02:00:00.000Z',
+    ]);
+    expect(firstBody.cursor).toEqual(expect.any(String));
+
+    const secondResponse = await app.inject({
+      method: 'GET',
+      url: `${url}&cursor=${encodeURIComponent(firstBody.cursor ?? '')}`,
+      headers: {
+        'x-api-key': createdKey.apiKey,
+      },
+    });
+
+    expect(secondResponse.statusCode).toBe(200);
+    const secondBody = secondResponse.json<{ cursor: string | null; result: Array<{ timestamp: string }> }>();
+    expect(secondBody.result.map((candle) => candle.timestamp)).toEqual([
+      '2026-04-28T01:00:00.000Z',
+      '2026-04-28T00:00:00.000Z',
+    ]);
+    expect(secondBody.cursor).toBeNull();
 
     await app.close();
   });
@@ -616,14 +732,14 @@ describe('chart API E2E', () => {
     expect(response.statusCode).toBe(200);
     expect(response.headers['x-effective-limit']).toBe('1000');
     expect(response.headers['x-requested-timeframe']).toBe('1min');
-    expect(response.headers['x-effective-timeframe']).toBe('12h');
-    expect(response.headers['x-page-from']).toBe('2024-01-01T00:00:00.000Z');
-    expect(response.headers['x-page-to']).toBe('2025-05-15T00:00:00.000Z');
+    expect(response.headers['x-effective-timeframe']).toBe('1min');
+    expect(response.headers['x-page-from']).toBe('2026-04-28T00:00:00.000Z');
+    expect(response.headers['x-page-to']).toBe('2026-04-28T01:00:00.000Z');
     expect(response.headers['x-moralis-cu-used']).toBe('150');
 
     const body = response.json<{ cursor: string | null; result: unknown[] }>();
-    expect(body.cursor).toEqual(expect.any(String));
-    expect(body.result).toHaveLength(0);
+    expect(body.cursor).toBeNull();
+    expect(body.result).toHaveLength(2);
     expect(state.moralisCalls).toBe(1);
     expect(state.providerUsage).toHaveLength(1);
     expect(state.backfillJobs).toHaveLength(0);
