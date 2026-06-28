@@ -9,6 +9,7 @@ export const backfillJobRepository = {
       `
       INSERT INTO ohlcv_backfill_jobs (
         id,
+        provider,
         chain,
         pair_address,
         timeframe,
@@ -17,11 +18,12 @@ export const backfillJobRepository = {
         to_ts,
         priority,
         reason
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       RETURNING id
       `,
       [
         generatedId,
+        params.provider ?? 'moralis',
         params.chain,
         params.pairAddress,
         params.timeframe,

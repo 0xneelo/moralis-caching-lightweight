@@ -3,8 +3,8 @@ import { findSuspiciousOhlcRanges, normalizeCandleOhlc } from '../candleQuality.
 import { getAdminSettings } from '../adminConfig.js';
 import { findMissingRanges, prioritizeVisibleRanges } from '../gaps.js';
 import { buildGapFetchLockKey, withRedisLock } from '../locks.js';
-import { fetchMoralisOhlcv } from '../moralis.js';
 import { normalizePairAddress } from '../pairAddress.js';
+import { getDefaultOhlcvProvider, resolveOhlcvProvider } from '../providers/ohlcv/registry.js';
 import { appendInteractionTraceEvent } from '../interactionLog.js';
 import { HttpError } from '../httpErrors.js';
 import {
@@ -23,6 +23,7 @@ import type {
   ChartCandle,
   ChartOhlcvResponse,
   OhlcvCurrency,
+  OhlcvProviderId,
   OhlcvTimeframe,
   StoredCandle,
 } from '../types.js';
@@ -48,9 +49,12 @@ export async function getOhlcvForChart(params: {
   maxProviderFetches?: number | undefined;
   interactionId?: string | undefined;
   refreshFromMoralis?: boolean | undefined;
+  provider?: OhlcvProviderId | undefined;
 }): Promise<ChartOhlcvResponse> {
   const pairAddress = normalizePairAddress(params.chain, params.pairAddress);
-  const forceMoralisRefresh = params.refreshFromMoralis === true;
+  const providerId = params.provider ?? getDefaultOhlcvProvider();
+  const provider = resolveOhlcvProvider(providerId);
+  const forceProviderRefresh = params.refreshFromMoralis === true;
 
   assertChartRangeAllowed({
     timeframe: params.timeframe,
@@ -71,6 +75,7 @@ export async function getOhlcvForChart(params: {
 
   const isDailyRequest = params.timeframe === DAILY_BOOTSTRAP_TIMEFRAME;
   const historyState = await marketHistoryStateRepository.get({
+    provider: providerId,
     chain: params.chain,
     pairAddress,
     timeframe: params.timeframe,
@@ -79,6 +84,7 @@ export async function getOhlcvForChart(params: {
   const dailyHistoryState = isDailyRequest
     ? historyState
     : await marketHistoryStateRepository.get({
+        provider: providerId,
         chain: params.chain,
         pairAddress,
         timeframe: DAILY_BOOTSTRAP_TIMEFRAME,
@@ -120,6 +126,7 @@ export async function getOhlcvForChart(params: {
 
   const fullHistoryBackfillQueued = fullHistoryRequested && !requiresDailyBootstrap
     ? await ensureFullHistoryBackfillQueuedIfNeeded({
+        provider: providerId,
         chain: params.chain,
         pairAddress,
         timeframe: params.timeframe,
@@ -137,7 +144,7 @@ export async function getOhlcvForChart(params: {
     historyProgressPct = dailyHistoryProgressPct ?? 0;
   }
 
-  const cacheKey = buildChartCacheKey({ ...params, pairAddress });
+  const cacheKey = buildChartCacheKey({ ...params, provider: providerId, pairAddress });
   const cached = await getJsonCache<ChartOhlcvResponse>(cacheKey);
 
   if (cached?.partial) {
@@ -156,7 +163,7 @@ export async function getOhlcvForChart(params: {
   if (
     cached &&
     !cached.partial &&
-    !forceMoralisRefresh &&
+    !forceProviderRefresh &&
     !requiresDailyBootstrap &&
     !(fullHistoryRequested && !historyComplete)
   ) {
@@ -175,7 +182,7 @@ export async function getOhlcvForChart(params: {
 
     return {
       ...cached,
-      source: cached.source === 'cache+moralis' ? 'cache' : cached.source,
+      source: cached.source === `cache+${providerId}` ? 'cache' : cached.source,
       requestedTimeframe: params.requestedTimeframe ?? params.timeframe,
       historyComplete: cached.historyComplete ?? historyComplete,
       historyWarming: cached.historyWarming ?? historyWarming,
@@ -206,6 +213,7 @@ export async function getOhlcvForChart(params: {
   }
 
   let storedCandles = await candleRepository.findCandles({
+    provider: providerId,
     chain: params.chain,
     pairAddress,
     timeframe: params.timeframe,
@@ -224,7 +232,7 @@ export async function getOhlcvForChart(params: {
     cachedCandlesInWindow: storedCandles.length,
   });
 
-  const missingRanges = forceMoralisRefresh
+  const missingRanges = forceProviderRefresh
     ? []
     : findMissingRanges({
         candles: storedCandles,
@@ -232,13 +240,13 @@ export async function getOhlcvForChart(params: {
         from: params.from,
         to: params.to,
       });
-  const suspiciousRanges = forceMoralisRefresh
+  const suspiciousRanges = forceProviderRefresh
     ? []
     : findSuspiciousRanges({
         timeframe: params.timeframe,
         candles: storedCandles,
       });
-  const fetchRanges = forceMoralisRefresh
+  const fetchRanges = forceProviderRefresh
     ? [{ from: params.from, to: params.to }]
     : mergeFetchRanges([...missingRanges, ...suspiciousRanges], params.timeframe);
   const visibleRange = {
@@ -247,7 +255,7 @@ export async function getOhlcvForChart(params: {
   };
   const prioritizedGaps = prioritizeVisibleRanges(fetchRanges, visibleRange);
 
-  if (forceMoralisRefresh) {
+  if (forceProviderRefresh) {
     await appendInteractionTraceEvent(params.interactionId, 'manual_refresh_from_moralis_requested', {
       route: '/api/charts/ohlcv',
       chain: params.chain,
@@ -275,10 +283,10 @@ export async function getOhlcvForChart(params: {
 
   let partial = false;
   let sourceOverride: ChartOhlcvResponse['source'] | undefined;
-  const moralisCandleTimes = new Set<number>();
+  const providerCandleTimes = new Set<number>();
   const maxProviderFetches = params.maxProviderFetches ?? 1;
   let providerFetches = 0;
-  const shouldFetchFromMoralis = !requiresDailyBootstrap;
+  const shouldFetchFromProvider = !requiresDailyBootstrap;
 
   if (fetchRanges.length > 0) {
     await appendInteractionTraceEvent(params.interactionId, 'cache_gaps_detected', {
@@ -294,7 +302,7 @@ export async function getOhlcvForChart(params: {
       })),
     });
 
-    if (!shouldFetchFromMoralis) {
+    if (!shouldFetchFromProvider) {
       partial = true;
       sourceOverride = 'partial';
       providerFetches = maxProviderFetches;
@@ -326,7 +334,7 @@ export async function getOhlcvForChart(params: {
           sourceOverride = 'partial';
           providerFetches = maxProviderFetches;
           await providerUsageRepository.logThrottleEvent({
-            provider: 'moralis',
+            provider: providerId,
             reason: 'provider_miss_rate_limited',
             chain: params.chain,
             pairAddress,
@@ -351,12 +359,12 @@ export async function getOhlcvForChart(params: {
     }
   }
 
-  if (shouldFetchFromMoralis) {
+  if (shouldFetchFromProvider) {
     for (const gap of prioritizedGaps) {
       if (providerFetches >= maxProviderFetches) {
         partial = true;
         await providerUsageRepository.logThrottleEvent({
-          provider: 'moralis',
+          provider: providerId,
           reason: 'max_provider_fetches_reached',
           chain: params.chain,
           pairAddress,
@@ -373,6 +381,7 @@ export async function getOhlcvForChart(params: {
 
       if (estimatedGapCandles > settings.maxSyncGapCandles) {
         await enqueueBackfillJob({
+          provider: providerId,
           chain: params.chain,
           pairAddress,
           timeframe: params.timeframe,
@@ -385,7 +394,7 @@ export async function getOhlcvForChart(params: {
 
         partial = true;
         await providerUsageRepository.logThrottleEvent({
-          provider: 'moralis',
+          provider: providerId,
           reason: 'gap_enqueued_too_large_for_sync',
           chain: params.chain,
           pairAddress,
@@ -398,6 +407,7 @@ export async function getOhlcvForChart(params: {
       }
 
       const lockKey = buildGapFetchLockKey({
+        provider: providerId,
         chain: params.chain,
         pairAddress,
         timeframe: params.timeframe,
@@ -413,12 +423,13 @@ export async function getOhlcvForChart(params: {
 
         if (params.externalApiKeyId) {
           await assertExternalApiKeyCuBudgetAvailable({
+            provider: providerId,
             apiKeyId: params.externalApiKeyId,
-            estimatedCu: maxPages * MORALIS_OHLC_CU_COST,
+            estimatedCu: estimateProviderCostBudget(providerId, maxPages),
           });
         }
 
-        const result = await fetchMoralisOhlcv({
+        const result = await provider.fetchOhlcv({
           chain: params.chain,
           pairAddress,
           timeframe: params.timeframe,
@@ -429,10 +440,11 @@ export async function getOhlcvForChart(params: {
           interactionId: params.interactionId,
         });
         for (const candle of result.candles) {
-          moralisCandleTimes.add(Math.floor(new Date(candle.timestamp).getTime() / 1000));
+          providerCandleTimes.add(Math.floor(new Date(candle.timestamp).getTime() / 1000));
         }
 
         await candleRepository.upsertCandles({
+          provider: providerId,
           chain: params.chain,
           pairAddress,
           timeframe: params.timeframe,
@@ -440,6 +452,7 @@ export async function getOhlcvForChart(params: {
           candles: result.candles,
         });
         await marketHistoryStateRepository.upsertBoundsFromCandles({
+          provider: providerId,
           chain: params.chain,
           pairAddress,
           timeframe: params.timeframe,
@@ -450,8 +463,8 @@ export async function getOhlcvForChart(params: {
         const usageLogParams =
           params.externalApiKeyId === undefined
             ? {
-                provider: 'moralis',
-                endpoint: 'getPairCandlesticks',
+                provider: providerId,
+                endpoint: provider.endpoint,
                 chain: params.chain,
                 pairAddress,
                 timeframe: params.timeframe,
@@ -463,8 +476,8 @@ export async function getOhlcvForChart(params: {
                 durationMs: result.durationMs,
               }
             : {
-                provider: 'moralis',
-                endpoint: 'getPairCandlesticks',
+                provider: providerId,
+                endpoint: provider.endpoint,
                 externalApiKeyId: params.externalApiKeyId,
                 chain: params.chain,
                 pairAddress,
@@ -489,6 +502,7 @@ export async function getOhlcvForChart(params: {
   }
 
   storedCandles = await candleRepository.findCandles({
+    provider: providerId,
     chain: params.chain,
     pairAddress,
     timeframe: params.timeframe,
@@ -505,12 +519,14 @@ export async function getOhlcvForChart(params: {
 
   if (fullHistoryRequested && !partial && !requiresDailyBootstrap && storedCandles.length > 0) {
     const bounds = await candleRepository.getBounds({
+      provider: providerId,
       chain: params.chain,
       pairAddress,
       timeframe: params.timeframe,
       currency: params.currency,
     });
     await marketHistoryStateRepository.markCompleted({
+      provider: providerId,
       chain: params.chain,
       pairAddress,
       timeframe: params.timeframe,
@@ -545,7 +561,7 @@ export async function getOhlcvForChart(params: {
     currency: params.currency,
     from: params.from.toISOString(),
     to: params.to.toISOString(),
-    source: sourceOverride ?? (partial ? 'partial' : fetchRanges.length > 0 ? 'cache+moralis' : 'cache'),
+    source: sourceOverride ?? (partial ? 'partial' : fetchRanges.length > 0 ? `cache+${providerId}` : 'cache'),
     partial,
     historyComplete: finalHistoryComplete,
     historyWarming: finalHistoryWarming,
@@ -555,7 +571,7 @@ export async function getOhlcvForChart(params: {
       storedCandles.map((candle) =>
         toChartCandle(
           candle,
-          moralisCandleTimes.has(Math.floor(candle.timestamp.getTime() / 1000)) ? 'moralis' : 'cache'
+          providerCandleTimes.has(Math.floor(candle.timestamp.getTime() / 1000)) ? providerId : 'cache'
         )
       ),
       params.from,
@@ -659,6 +675,7 @@ function mergeFetchRanges(ranges: Array<{ from: Date; to: Date }>, timeframe: Oh
 }
 
 async function ensureFullHistoryBackfillQueuedIfNeeded(params: {
+  provider: OhlcvProviderId;
   chain: string;
   pairAddress: string;
   timeframe: OhlcvTimeframe;
@@ -681,6 +698,7 @@ async function ensureFullHistoryBackfillQueuedIfNeeded(params: {
 
   try {
     const enqueueResult = await enqueueBackfillJob({
+      provider: params.provider,
       chain: params.chain,
       pairAddress: params.pairAddress,
       timeframe: params.timeframe,
@@ -692,6 +710,7 @@ async function ensureFullHistoryBackfillQueuedIfNeeded(params: {
     });
 
     await marketHistoryStateRepository.markQueued({
+      provider: params.provider,
       chain: params.chain,
       pairAddress: params.pairAddress,
       timeframe: params.timeframe,
@@ -792,6 +811,10 @@ function normalizeChartCandle(candle: ChartCandle): ChartCandle {
     low: rangeLow,
     close: clamp(close, rangeLow, rangeHigh),
   };
+}
+
+function estimateProviderCostBudget(provider: OhlcvProviderId, maxPages: number) {
+  return provider === 'moralis' ? maxPages * MORALIS_OHLC_CU_COST : maxPages;
 }
 
 function clamp(value: number, min: number, max: number) {

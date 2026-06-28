@@ -42,6 +42,13 @@ validate_env() {
     fi
   done
 
+  if [[ "${OHLCV_DEFAULT_PROVIDER:-moralis}" == "coingecko" || "${COINGECKO_OHLCV_ENABLED:-false}" == "true" ]]; then
+    if [[ -z "${COINGECKO_API_KEY:-}" ]]; then
+      echo "Missing required env var: COINGECKO_API_KEY" >&2
+      exit 2
+    fi
+  fi
+
 }
 
 update_repo() {

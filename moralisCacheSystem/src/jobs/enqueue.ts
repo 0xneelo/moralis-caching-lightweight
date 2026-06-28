@@ -1,19 +1,24 @@
 import { backfillJobRepository } from '../repositories/backfillJobs.js';
 import { normalizePairAddress } from '../pairAddress.js';
+import { getDefaultOhlcvProvider } from '../providers/ohlcv/registry.js';
 import type { BackfillJobPayload } from '../types.js';
 import { getBackfillQueue } from './queue.js';
 
 export async function enqueueBackfillJob(params: Omit<BackfillJobPayload, 'dbJobId'>) {
-  const dbJobId = await backfillJobRepository.create(params);
+  const payload = {
+    ...params,
+    provider: params.provider ?? getDefaultOhlcvProvider(),
+  };
+  const dbJobId = await backfillJobRepository.create(payload);
   const job = await getBackfillQueue().add(
     'backfill',
     {
-      ...params,
+      ...payload,
       dbJobId,
     },
     {
-      priority: priorityToNumber(params.priority),
-      jobId: dedupeJobId(params),
+      priority: priorityToNumber(payload.priority),
+      jobId: dedupeJobId(payload),
     }
   );
 
@@ -36,11 +41,12 @@ function priorityToNumber(priority: BackfillJobPayload['priority']) {
   }
 }
 
-function dedupeJobId(params: Omit<BackfillJobPayload, 'dbJobId'>) {
+function dedupeJobId(params: Omit<BackfillJobPayload, 'dbJobId'> & { provider: NonNullable<BackfillJobPayload['provider']> }) {
   const pairAddress = normalizePairAddress(params.chain, params.pairAddress);
 
   return [
     'backfill',
+    params.provider,
     params.chain,
     pairAddress,
     params.timeframe,

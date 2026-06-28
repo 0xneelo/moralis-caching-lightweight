@@ -1,9 +1,10 @@
 import { query } from '../db.js';
-import type { MoralisCandle, OhlcvCurrency, OhlcvTimeframe } from '../types.js';
+import type { MoralisCandle, OhlcvCurrency, OhlcvProviderId, OhlcvTimeframe } from '../types.js';
 
 export type FullHistoryStatus = 'unknown' | 'queued' | 'running' | 'complete' | 'failed';
 
 export type MarketHistoryState = {
+  provider: OhlcvProviderId;
   chain: string;
   pairAddress: string;
   timeframe: OhlcvTimeframe;
@@ -21,12 +22,14 @@ export type MarketHistoryState = {
 
 export const marketHistoryStateRepository = {
   async get(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
     currency: OhlcvCurrency;
   }): Promise<MarketHistoryState | null> {
     const result = await query<{
+      provider: OhlcvProviderId;
       chain: string;
       pair_address: string;
       timeframe: OhlcvTimeframe;
@@ -43,6 +46,7 @@ export const marketHistoryStateRepository = {
     }>(
       `
       SELECT
+        provider,
         chain,
         pair_address,
         timeframe,
@@ -57,12 +61,13 @@ export const marketHistoryStateRepository = {
         full_history_error,
         updated_at
       FROM market_history_state
-      WHERE chain = $1
-        AND pair_address = $2
-        AND timeframe = $3
-        AND currency = $4
+      WHERE provider = $1
+        AND chain = $2
+        AND pair_address = $3
+        AND timeframe = $4
+        AND currency = $5
       `,
-      [params.chain, params.pairAddress, params.timeframe, params.currency]
+      [params.provider, params.chain, params.pairAddress, params.timeframe, params.currency]
     );
 
     const row = result.rows[0];
@@ -71,6 +76,7 @@ export const marketHistoryStateRepository = {
     }
 
     return {
+      provider: row.provider,
       chain: row.chain,
       pairAddress: row.pair_address,
       timeframe: row.timeframe,
@@ -88,6 +94,7 @@ export const marketHistoryStateRepository = {
   },
 
   async markQueued(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -98,6 +105,7 @@ export const marketHistoryStateRepository = {
     await query(
       `
       INSERT INTO market_history_state (
+        provider,
         chain,
         pair_address,
         timeframe,
@@ -108,8 +116,8 @@ export const marketHistoryStateRepository = {
         full_history_requested_at,
         full_history_error,
         updated_at
-      ) VALUES ($1,$2,$3,$4,$5,'queued',$6,now(),NULL,now())
-      ON CONFLICT (chain, pair_address, timeframe, currency)
+      ) VALUES ($1,$2,$3,$4,$5,$6,'queued',$7,now(),NULL,now())
+      ON CONFLICT (provider, chain, pair_address, timeframe, currency)
       DO UPDATE SET
         history_floor_ts = EXCLUDED.history_floor_ts,
         full_history_status = 'queued',
@@ -119,6 +127,7 @@ export const marketHistoryStateRepository = {
         updated_at = now()
       `,
       [
+        params.provider,
         params.chain,
         params.pairAddress,
         params.timeframe,
@@ -130,6 +139,7 @@ export const marketHistoryStateRepository = {
   },
 
   async markRunning(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -138,6 +148,7 @@ export const marketHistoryStateRepository = {
     await query(
       `
       INSERT INTO market_history_state (
+        provider,
         chain,
         pair_address,
         timeframe,
@@ -145,18 +156,19 @@ export const marketHistoryStateRepository = {
         history_floor_ts,
         full_history_status,
         updated_at
-      ) VALUES ($1,$2,$3,$4,$5,'running',now())
-      ON CONFLICT (chain, pair_address, timeframe, currency)
+      ) VALUES ($1,$2,$3,$4,$5,$6,'running',now())
+      ON CONFLICT (provider, chain, pair_address, timeframe, currency)
       DO UPDATE SET
         full_history_status = 'running',
         full_history_error = NULL,
         updated_at = now()
       `,
-      [params.chain, params.pairAddress, params.timeframe, params.currency, new Date('2024-01-01T00:00:00.000Z')]
+      [params.provider, params.chain, params.pairAddress, params.timeframe, params.currency, new Date('2024-01-01T00:00:00.000Z')]
     );
   },
 
   async markCompleted(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -167,6 +179,7 @@ export const marketHistoryStateRepository = {
     await query(
       `
       INSERT INTO market_history_state (
+        provider,
         chain,
         pair_address,
         timeframe,
@@ -178,8 +191,8 @@ export const marketHistoryStateRepository = {
         full_history_completed_at,
         full_history_error,
         updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,'complete',now(),NULL,now())
-      ON CONFLICT (chain, pair_address, timeframe, currency)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'complete',now(),NULL,now())
+      ON CONFLICT (provider, chain, pair_address, timeframe, currency)
       DO UPDATE SET
         market_start_ts = EXCLUDED.market_start_ts,
         latest_synced_ts = EXCLUDED.latest_synced_ts,
@@ -189,6 +202,7 @@ export const marketHistoryStateRepository = {
         updated_at = now()
       `,
       [
+        params.provider,
         params.chain,
         params.pairAddress,
         params.timeframe,
@@ -201,6 +215,7 @@ export const marketHistoryStateRepository = {
   },
 
   async markFailed(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -210,6 +225,7 @@ export const marketHistoryStateRepository = {
     await query(
       `
       INSERT INTO market_history_state (
+        provider,
         chain,
         pair_address,
         timeframe,
@@ -218,14 +234,15 @@ export const marketHistoryStateRepository = {
         full_history_status,
         full_history_error,
         updated_at
-      ) VALUES ($1,$2,$3,$4,$5,'failed',$6,now())
-      ON CONFLICT (chain, pair_address, timeframe, currency)
+      ) VALUES ($1,$2,$3,$4,$5,$6,'failed',$7,now())
+      ON CONFLICT (provider, chain, pair_address, timeframe, currency)
       DO UPDATE SET
         full_history_status = 'failed',
         full_history_error = EXCLUDED.full_history_error,
         updated_at = now()
       `,
       [
+        params.provider,
         params.chain,
         params.pairAddress,
         params.timeframe,
@@ -237,6 +254,7 @@ export const marketHistoryStateRepository = {
   },
 
   async upsertBoundsFromCandles(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -272,6 +290,7 @@ export const marketHistoryStateRepository = {
     await query(
       `
       INSERT INTO market_history_state (
+        provider,
         chain,
         pair_address,
         timeframe,
@@ -280,8 +299,8 @@ export const marketHistoryStateRepository = {
         market_start_ts,
         latest_synced_ts,
         updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,now())
-      ON CONFLICT (chain, pair_address, timeframe, currency)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())
+      ON CONFLICT (provider, chain, pair_address, timeframe, currency)
       DO UPDATE SET
         market_start_ts = CASE
           WHEN market_history_state.market_start_ts IS NULL THEN EXCLUDED.market_start_ts
@@ -294,6 +313,7 @@ export const marketHistoryStateRepository = {
         updated_at = now()
       `,
       [
+        params.provider,
         params.chain,
         params.pairAddress,
         params.timeframe,

@@ -16,6 +16,8 @@ export type OhlcvTimeframe =
 
 export type OhlcvCurrency = 'usd' | 'native';
 
+export type OhlcvProviderId = 'moralis' | 'coingecko';
+
 export type StoredCandle = {
   timestamp: Date;
   open: string;
@@ -45,7 +47,7 @@ export type ChartCandle = {
   close: number;
   volume: number | null;
   trades: number | null;
-  source?: 'cache' | 'moralis' | 'demo' | 'filled';
+  source?: 'cache' | OhlcvProviderId | 'demo' | 'filled';
 };
 
 export type ChartOhlcvResponse = {
@@ -56,7 +58,7 @@ export type ChartOhlcvResponse = {
   currency: OhlcvCurrency;
   from: string;
   to: string;
-  source: 'cache' | 'cache+moralis' | 'partial' | 'demo';
+  source: 'cache' | `cache+${OhlcvProviderId}` | 'partial' | 'demo';
   partial: boolean;
   historyComplete: boolean;
   historyWarming: boolean;
@@ -79,6 +81,7 @@ export type BackfillReason =
 
 export type BackfillJobPayload = {
   dbJobId?: string;
+  provider?: OhlcvProviderId;
   chain: string;
   pairAddress: string;
   timeframe: OhlcvTimeframe;

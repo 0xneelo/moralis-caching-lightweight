@@ -1,8 +1,8 @@
 import { Worker } from 'bullmq';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
-import { fetchMoralisOhlcv } from '../moralis.js';
 import { normalizePairAddress } from '../pairAddress.js';
+import { getDefaultOhlcvProvider, resolveOhlcvProvider } from '../providers/ohlcv/registry.js';
 import { backfillJobRepository } from '../repositories/backfillJobs.js';
 import { candleRepository } from '../repositories/candles.js';
 import { marketHistoryStateRepository } from '../repositories/marketHistoryState.js';
@@ -16,6 +16,8 @@ export function createBackfillWorker() {
     backfillQueueName,
     async (job) => {
       const payload = job.data;
+      const providerId = payload.provider ?? getDefaultOhlcvProvider();
+      const provider = resolveOhlcvProvider(providerId);
       const dbJobId = payload.dbJobId;
       const pairAddress = normalizePairAddress(payload.chain, payload.pairAddress);
 
@@ -24,6 +26,7 @@ export function createBackfillWorker() {
       }
       if (payload.reason === 'initial_history_load') {
         await marketHistoryStateRepository.markRunning({
+          provider: providerId,
           chain: payload.chain,
           pairAddress,
           timeframe: payload.timeframe,
@@ -32,7 +35,7 @@ export function createBackfillWorker() {
       }
 
       try {
-        const result = await fetchMoralisOhlcv({
+        const result = await provider.fetchOhlcv({
           chain: payload.chain,
           pairAddress,
           timeframe: payload.timeframe,
@@ -43,6 +46,7 @@ export function createBackfillWorker() {
         });
 
         const upsertResult = await candleRepository.upsertCandles({
+          provider: providerId,
           chain: payload.chain,
           pairAddress,
           timeframe: payload.timeframe,
@@ -50,6 +54,7 @@ export function createBackfillWorker() {
           candles: result.candles,
         });
         await marketHistoryStateRepository.upsertBoundsFromCandles({
+          provider: providerId,
           chain: payload.chain,
           pairAddress,
           timeframe: payload.timeframe,
@@ -58,8 +63,8 @@ export function createBackfillWorker() {
         });
 
         await providerUsageRepository.log({
-          provider: 'moralis',
-          endpoint: 'getPairCandlesticks',
+          provider: providerId,
+          endpoint: provider.endpoint,
           chain: payload.chain,
           pairAddress,
           timeframe: payload.timeframe,
@@ -80,6 +85,7 @@ export function createBackfillWorker() {
         }
         if (payload.reason === 'initial_history_load') {
           const bounds = await candleRepository.getBounds({
+            provider: providerId,
             chain: payload.chain,
             pairAddress,
             timeframe: payload.timeframe,
@@ -88,6 +94,7 @@ export function createBackfillWorker() {
 
           if (!result.truncated) {
             await marketHistoryStateRepository.markCompleted({
+              provider: providerId,
               chain: payload.chain,
               pairAddress,
               timeframe: payload.timeframe,
@@ -97,6 +104,7 @@ export function createBackfillWorker() {
             });
           } else {
             await marketHistoryStateRepository.markFailed({
+              provider: providerId,
               chain: payload.chain,
               pairAddress,
               timeframe: payload.timeframe,
@@ -107,7 +115,7 @@ export function createBackfillWorker() {
         }
 
         if (result.truncated) {
-          logger.warn({ payload }, 'Backfill reached maxPages and may be incomplete');
+          logger.warn({ payload, provider: providerId }, 'Backfill reached maxPages and may be incomplete');
         }
       } catch (error) {
         if (dbJobId) {
@@ -118,6 +126,7 @@ export function createBackfillWorker() {
         }
         if (payload.reason === 'initial_history_load') {
           await marketHistoryStateRepository.markFailed({
+            provider: providerId,
             chain: payload.chain,
             pairAddress,
             timeframe: payload.timeframe,

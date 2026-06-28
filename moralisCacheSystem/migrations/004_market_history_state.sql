@@ -1,4 +1,5 @@
 CREATE TABLE IF NOT EXISTS market_history_state (
+  provider TEXT NOT NULL DEFAULT 'moralis',
   chain TEXT NOT NULL,
   pair_address TEXT NOT NULL,
   timeframe TEXT NOT NULL,
@@ -12,7 +13,7 @@ CREATE TABLE IF NOT EXISTS market_history_state (
   full_history_completed_at TIMESTAMPTZ,
   full_history_error TEXT,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (chain, pair_address, timeframe, currency)
+  PRIMARY KEY (provider, chain, pair_address, timeframe, currency)
 );
 
 CREATE INDEX IF NOT EXISTS market_history_state_status_idx

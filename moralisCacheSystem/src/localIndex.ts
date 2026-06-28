@@ -142,6 +142,7 @@ const chartQuerySchema = z.object({
     .string()
     .optional()
     .transform((value) => value === 'true'),
+  provider: z.enum(['moralis', 'coingecko']).default('moralis'),
 });
 
 const moralisCompatQuerySchema = z.object({
@@ -154,6 +155,7 @@ const moralisCompatQuerySchema = z.object({
   toDate: z.string().datetime(),
   limit: z.coerce.number().int().optional(),
   cursor: z.string().min(1).optional(),
+  provider: z.enum(['moralis', 'coingecko']).default('moralis'),
 });
 
 const tokenOhlcCountbackQuerySchema = z.object({
@@ -163,6 +165,7 @@ const tokenOhlcCountbackQuerySchema = z.object({
   resolution: z.string().min(1),
   countBack: z.coerce.number().int().positive(),
   currency: z.enum(['usd', 'native']).default(config.DEFAULT_CURRENCY),
+  provider: z.enum(['moralis', 'coingecko']).default('moralis'),
 });
 
 const localExternalApiKey = await ensureLocalExternalApiKey();
@@ -383,6 +386,10 @@ app.get('/api/charts/ohlcv', async (request, reply) => {
     return reply.status(400).send({
       error: parsed.error.issues.map((issue) => issue.message).join(', '),
     });
+  }
+
+  if (parsed.data.provider !== 'moralis') {
+    return reply.status(400).send({ error: 'Local memory mode currently supports provider=moralis only' });
   }
 
   const pairAddress = normalizePairAddress(parsed.data.chain, parsed.data.pairAddress);
@@ -943,6 +950,9 @@ app.get('/api/v2.2/pairs/:pairAddress/ohlcv', async (request, reply) => {
       : parsedQuery.error.issues.map((issue) => issue.message).join(', ');
     return reply.status(400).send({ error });
   }
+  if (parsedQuery.data.provider !== 'moralis') {
+    return reply.status(400).send({ error: 'Local memory mode currently supports provider=moralis only' });
+  }
 
   return injectMoralisCompatOhlcv({
     reply,
@@ -968,6 +978,9 @@ app.get('/api/token/ohlc/countback', async (request, reply) => {
     return reply.status(400).send({
       error: parsed.error.issues.map((issue) => issue.message).join(', '),
     });
+  }
+  if (parsed.data.provider !== 'moralis') {
+    return reply.status(400).send({ error: 'Local memory mode currently supports provider=moralis only' });
   }
 
   const chain = normalizeExternalChainId(parsed.data.chainId);
@@ -1006,6 +1019,7 @@ app.get('/api/token/ohlc/countback', async (request, reply) => {
       currency: parsed.data.currency,
       from: from.toISOString(),
       to: to.toISOString(),
+      provider: parsed.data.provider,
     });
 
     void app.inject({
@@ -1041,6 +1055,9 @@ app.get('/token/mainnet/pairs/:pairAddress/ohlcv', async (request, reply) => {
       ? 'pairAddress is required'
       : parsedQuery.error.issues.map((issue) => issue.message).join(', ');
     return reply.status(400).send({ error });
+  }
+  if (parsedQuery.data.provider !== 'moralis') {
+    return reply.status(400).send({ error: 'Local memory mode currently supports provider=moralis only' });
   }
 
   return injectMoralisCompatOhlcv({

@@ -115,6 +115,7 @@ export type AdminApiKey = {
 };
 
 export type AdminCacheMarket = {
+  provider?: 'moralis' | 'coingecko';
   chain: string;
   pairAddress: string;
   timeframe: string;
@@ -163,6 +164,7 @@ export type AdminDashboard = {
     }>;
     recent: Array<{
       createdAt: string;
+      provider?: string;
       endpoint: string;
       externalApiKeyId: string | null;
       chain: string | null;

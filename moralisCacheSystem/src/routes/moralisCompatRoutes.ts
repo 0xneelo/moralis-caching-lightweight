@@ -5,8 +5,8 @@ import { getChartCacheTtl, getJsonCache, setJsonCache } from '../cache.js';
 import { config } from '../config.js';
 import { badRequest } from '../httpErrors.js';
 import { enqueueBackfillJob } from '../jobs/enqueue.js';
-import { fetchMoralisOhlcv } from '../moralis.js';
 import { normalizePairAddress } from '../pairAddress.js';
+import { resolveOhlcvProvider, resolveRequestedOhlcvProvider } from '../providers/ohlcv/registry.js';
 import { enforceExternalApiKeyRequestRateLimit } from '../rateLimit.js';
 import { candleRepository } from '../repositories/candles.js';
 import { providerUsageRepository } from '../repositories/providerUsage.js';
@@ -15,7 +15,7 @@ import {
   maxSyncCandlesByTimeframe,
   timeframeSeconds,
 } from '../timeframes.js';
-import type { ChartCandle, OhlcvCurrency, OhlcvTimeframe, StoredCandle } from '../types.js';
+import type { ChartCandle, OhlcvCurrency, OhlcvProviderId, OhlcvTimeframe, StoredCandle } from '../types.js';
 
 type MoralisOhlcvCandle = {
   timestamp: string;
@@ -56,6 +56,7 @@ type TokenOhlcResult = {
 type MoralisCompatCursor = {
   beforeDate: string;
   effectiveTimeframe: OhlcvTimeframe;
+  provider?: OhlcvProviderId;
 };
 
 const MAX_LIMIT = 1000;
@@ -71,6 +72,7 @@ const moralisOhlcvQuerySchema = z.object({
   toDate: z.string().datetime(),
   limit: z.coerce.number().int().optional(),
   cursor: z.string().min(1).optional(),
+  provider: z.enum(['moralis', 'coingecko']).optional(),
 });
 
 const tokenOhlcQuerySchema = z.object({
@@ -80,6 +82,7 @@ const tokenOhlcQuerySchema = z.object({
   to: z.coerce.number().int().positive(),
   resolution: z.string().min(1),
   limit: z.coerce.number().int().positive().optional(),
+  provider: z.enum(['moralis', 'coingecko']).optional(),
 });
 
 const tokenOhlcCountbackQuerySchema = z.object({
@@ -89,6 +92,7 @@ const tokenOhlcCountbackQuerySchema = z.object({
   resolution: z.string().min(1),
   countBack: z.coerce.number().int().positive(),
   currency: z.enum(['usd', 'native']).optional(),
+  provider: z.enum(['moralis', 'coingecko']).optional(),
 });
 
 export async function registerMoralisCompatRoutes(app: FastifyInstance) {
@@ -104,6 +108,7 @@ export async function registerMoralisCompatRoutes(app: FastifyInstance) {
     reply.header('Cache-Control', 'private, max-age=5');
 
     const result = await getTokenOhlcCountbackResponse({
+      provider: resolveRequestedOhlcvProvider(parsed.data.provider),
       chain: normalizeChainId(parsed.data.chainId),
       pairAddress: parsed.data.pairAddress,
       timeframe: mapResolutionToTimeframe(parsed.data.resolution),
@@ -128,6 +133,7 @@ export async function registerMoralisCompatRoutes(app: FastifyInstance) {
     reply.header('Cache-Control', 'private, max-age=5');
 
     const result = await getTokenOhlcResponse({
+      provider: resolveRequestedOhlcvProvider(parsed.data.provider),
       chain: normalizeChainId(parsed.data.chainId),
       pairAddress: parsed.data.pairAddress,
       timeframe: mapResolutionToTimeframe(parsed.data.resolution),
@@ -154,6 +160,7 @@ export async function registerMoralisCompatRoutes(app: FastifyInstance) {
     reply.header('Cache-Control', 'private, max-age=5');
 
     const result = await getMoralisOhlcvResponse({
+      provider: resolveRequestedOhlcvProvider(parsed.data.provider),
       chain: normalizeChainId(parsed.data.chain ?? 'eth'),
       pairAddress,
       timeframe: parsed.data.timeframe,
@@ -184,6 +191,7 @@ export async function registerMoralisCompatRoutes(app: FastifyInstance) {
     reply.header('Cache-Control', 'private, max-age=5');
 
     const result = await getMoralisOhlcvResponse({
+      provider: resolveRequestedOhlcvProvider(parsed.data.provider),
       chain: 'solana',
       pairAddress,
       timeframe: parsed.data.timeframe,
@@ -203,6 +211,7 @@ export async function registerMoralisCompatRoutes(app: FastifyInstance) {
 }
 
 async function getTokenOhlcResponse(params: {
+  provider: OhlcvProviderId;
   chain: string;
   pairAddress: string;
   timeframe: OhlcvTimeframe;
@@ -229,6 +238,7 @@ async function getTokenOhlcResponse(params: {
   }
 
   const storedCandles = await candleRepository.findCandles({
+    provider: params.provider,
     chain: params.chain,
     pairAddress,
     timeframe: params.timeframe,
@@ -237,6 +247,7 @@ async function getTokenOhlcResponse(params: {
     to: params.to,
   });
   warmExternalCacheInBackground({
+    provider: params.provider,
     chain: params.chain,
     pairAddress,
     timeframe: params.timeframe,
@@ -251,6 +262,7 @@ async function getTokenOhlcResponse(params: {
   const response = {
     body: toTokenOhlcBody(selectedCandles, result),
     headers: buildCompatibilityHeaders({
+      provider: params.provider,
       source: result.length > 0 ? 'cache' : 'partial',
       cuUsed: 0,
       requestedTimeframe: params.timeframe,
@@ -266,6 +278,7 @@ async function getTokenOhlcResponse(params: {
 }
 
 async function getTokenOhlcCountbackResponse(params: {
+  provider: OhlcvProviderId;
   chain: string;
   pairAddress: string;
   timeframe: OhlcvTimeframe;
@@ -287,6 +300,7 @@ async function getTokenOhlcCountbackResponse(params: {
   }
 
   const storedCandles = await candleRepository.findCountbackCandles({
+    provider: params.provider,
     chain: params.chain,
     pairAddress,
     timeframe: params.timeframe,
@@ -298,6 +312,7 @@ async function getTokenOhlcCountbackResponse(params: {
   if (storedCandles.length < effectiveLimit) {
     const warmFrom = getCountbackWarmFrom(params.to, params.timeframe, effectiveLimit);
     warmExternalCacheInBackground({
+      provider: params.provider,
       chain: params.chain,
       pairAddress,
       timeframe: params.timeframe,
@@ -313,6 +328,7 @@ async function getTokenOhlcCountbackResponse(params: {
     body: toTokenOhlcBody(storedCandles, result),
     headers: {
       ...buildCompatibilityHeaders({
+        provider: params.provider,
         source: storedCandles.length >= effectiveLimit ? 'cache' : 'partial',
         cuUsed: 0,
         requestedTimeframe: params.timeframe,
@@ -330,6 +346,7 @@ async function getTokenOhlcCountbackResponse(params: {
 }
 
 async function getMoralisOhlcvResponse(params: {
+  provider: OhlcvProviderId;
   chain: string;
   pairAddress: string;
   timeframe: OhlcvTimeframe;
@@ -350,10 +367,14 @@ async function getMoralisOhlcvResponse(params: {
   }
 
   const effectiveTimeframe = params.timeframe;
+  const provider = resolveOhlcvProvider(params.provider);
   const effectiveLimit = clampLimit(effectiveTimeframe, params.requestedLimit);
   const cursor = decodeCursor(params.cursor);
 
   if (cursor && cursor.effectiveTimeframe !== effectiveTimeframe) {
+    throw badRequest('Invalid cursor');
+  }
+  if (cursor?.provider && cursor.provider !== params.provider) {
     throw badRequest('Invalid cursor');
   }
 
@@ -366,6 +387,7 @@ async function getMoralisOhlcvResponse(params: {
         result: [],
       },
       headers: buildCompatibilityHeaders({
+        provider: params.provider,
         source: 'cache',
         cuUsed: 0,
         requestedTimeframe: params.timeframe,
@@ -378,6 +400,7 @@ async function getMoralisOhlcvResponse(params: {
   }
 
   const compatCacheKey = buildMoralisCompatCacheKey({
+    provider: params.provider,
     chain: params.chain,
     pairAddress: params.pairAddress,
     requestedTimeframe: params.timeframe,
@@ -394,6 +417,7 @@ async function getMoralisOhlcvResponse(params: {
 
   const pairAddress = normalizePairAddress(params.chain, params.pairAddress);
   let pageCandles = await candleRepository.findCandlesPageDesc({
+    provider: params.provider,
     chain: params.chain,
     pairAddress,
     timeframe: effectiveTimeframe,
@@ -409,7 +433,7 @@ async function getMoralisOhlcvResponse(params: {
   let providerTruncated = false;
 
   if (pageCandles.length <= effectiveLimit) {
-    const providerResult = await fetchMoralisOhlcv({
+    const providerResult = await provider.fetchOhlcv({
       chain: params.chain,
       pairAddress,
       timeframe: effectiveTimeframe,
@@ -419,10 +443,11 @@ async function getMoralisOhlcvResponse(params: {
       maxPages: 1,
     });
     providerTruncated = providerResult.truncated;
-    source = 'cache+moralis';
+    source = `cache+${params.provider}`;
     cuUsed = providerResult.estimatedCu;
 
     await candleRepository.upsertCandles({
+      provider: params.provider,
       chain: params.chain,
       pairAddress,
       timeframe: effectiveTimeframe,
@@ -431,8 +456,8 @@ async function getMoralisOhlcvResponse(params: {
     });
 
     await providerUsageRepository.log({
-      provider: 'moralis',
-      endpoint: 'getPairCandlesticks',
+      provider: params.provider,
+      endpoint: provider.endpoint,
       externalApiKeyId: params.externalApiKeyId,
       chain: params.chain,
       pairAddress,
@@ -446,6 +471,7 @@ async function getMoralisOhlcvResponse(params: {
     });
 
     pageCandles = await candleRepository.findCandlesPageDesc({
+      provider: params.provider,
       chain: params.chain,
       pairAddress,
       timeframe: effectiveTimeframe,
@@ -463,6 +489,7 @@ async function getMoralisOhlcvResponse(params: {
     ? encodeCursor({
         beforeDate: selectedCandles[selectedCandles.length - 1]!.timestamp.toISOString(),
         effectiveTimeframe,
+        provider: params.provider,
       })
     : null;
   const newestReturned = selectedCandles[0]?.timestamp ?? null;
@@ -474,6 +501,7 @@ async function getMoralisOhlcvResponse(params: {
       result,
     },
     headers: buildCompatibilityHeaders({
+      provider: params.provider,
       source,
       cuUsed,
       requestedTimeframe: params.timeframe,
@@ -528,6 +556,7 @@ function setCompatibilityHeaders(reply: FastifyReply, headers: Record<string, st
 }
 
 function buildCompatibilityHeaders(params: {
+  provider: OhlcvProviderId;
   source: string;
   cuUsed: number;
   requestedTimeframe: OhlcvTimeframe;
@@ -537,7 +566,9 @@ function buildCompatibilityHeaders(params: {
   pageTo: Date | null;
 }) {
   return {
+    'x-ohlcv-provider': params.provider,
     'x-cache-source': params.source,
+    'x-provider-cost-used': String(params.cuUsed),
     'x-moralis-cu-used': String(params.cuUsed),
     'x-requested-timeframe': params.requestedTimeframe,
     'x-effective-timeframe': params.effectiveTimeframe,
@@ -582,6 +613,7 @@ function toTokenOhlcBody(storedCandles: StoredCandle[], result: MoralisOhlcvCand
 }
 
 function warmExternalCacheInBackground(params: {
+  provider: OhlcvProviderId;
   chain: string;
   pairAddress: string;
   timeframe: OhlcvTimeframe;
@@ -595,6 +627,7 @@ function warmExternalCacheInBackground(params: {
   }
 
   void enqueueBackfillJob({
+    provider: params.provider,
     chain: params.chain,
     pairAddress: params.pairAddress,
     timeframe: params.timeframe,
@@ -620,7 +653,8 @@ function decodeCursor(cursor: string | undefined) {
       typeof parsed.beforeDate !== 'string' ||
       Number.isNaN(new Date(parsed.beforeDate).getTime()) ||
       typeof parsed.effectiveTimeframe !== 'string' ||
-      !isOhlcvTimeframe(parsed.effectiveTimeframe)
+      !isOhlcvTimeframe(parsed.effectiveTimeframe) ||
+      (parsed.provider !== undefined && parsed.provider !== 'moralis' && parsed.provider !== 'coingecko')
     ) {
       throw new Error('Invalid cursor beforeDate');
     }
@@ -644,6 +678,22 @@ function normalizeChainId(chainId: string) {
 
   if (normalized === '1' || normalized === '0x1') {
     return 'eth';
+  }
+
+  if (normalized === '56' || normalized === '0x38') {
+    return 'bsc';
+  }
+
+  if (normalized === '42161' || normalized === '0xa4b1') {
+    return 'arbitrum';
+  }
+
+  if (normalized === '146' || normalized === '0x92') {
+    return 'sonic';
+  }
+
+  if (normalized === '0' || normalized === 'sol') {
+    return 'solana';
   }
 
   return normalized;
@@ -678,6 +728,7 @@ function mapResolutionToTimeframe(resolution: string): OhlcvTimeframe {
 }
 
 function buildMoralisCompatCacheKey(params: {
+  provider: OhlcvProviderId;
   chain: string;
   pairAddress: string;
   requestedTimeframe: OhlcvTimeframe;
@@ -689,7 +740,8 @@ function buildMoralisCompatCacheKey(params: {
 }) {
   return [
     'moralis-compat',
-    'v3',
+    'v4',
+    params.provider,
     params.chain,
     normalizePairAddress(params.chain, params.pairAddress),
     params.requestedTimeframe,
@@ -702,6 +754,7 @@ function buildMoralisCompatCacheKey(params: {
 }
 
 function buildTokenOhlcCacheKey(params: {
+  provider: OhlcvProviderId;
   chain: string;
   pairAddress: string;
   timeframe: OhlcvTimeframe;
@@ -712,7 +765,8 @@ function buildTokenOhlcCacheKey(params: {
 }) {
   return [
     'token-ohlc',
-    'v1',
+    'v2',
+    params.provider,
     params.chain,
     normalizePairAddress(params.chain, params.pairAddress),
     params.timeframe,
@@ -724,6 +778,7 @@ function buildTokenOhlcCacheKey(params: {
 }
 
 function buildTokenOhlcCountbackCacheKey(params: {
+  provider: OhlcvProviderId;
   chain: string;
   pairAddress: string;
   timeframe: OhlcvTimeframe;
@@ -733,7 +788,8 @@ function buildTokenOhlcCountbackCacheKey(params: {
 }) {
   return [
     'token-ohlc-countback',
-    'v1',
+    'v2',
+    params.provider,
     params.chain,
     normalizePairAddress(params.chain, params.pairAddress),
     params.timeframe,

@@ -2,9 +2,10 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { badRequest } from '../httpErrors.js';
+import { resolveRequestedOhlcvProvider } from '../providers/ohlcv/registry.js';
 import { getOhlcvForChart } from '../services/chartService.js';
 import { getEffectiveAdaptiveTimeframe, isOhlcvTimeframe } from '../timeframes.js';
-import type { OhlcvCurrency, OhlcvTimeframe } from '../types.js';
+import type { OhlcvCurrency, OhlcvProviderId, OhlcvTimeframe } from '../types.js';
 
 const chartQuerySchema = z.object({
   chain: z.string().min(1),
@@ -23,6 +24,7 @@ const chartQuerySchema = z.object({
       message: 'Unsupported requested timeframe',
     })
     .optional(),
+  provider: z.enum(['moralis', 'coingecko']).optional(),
 });
 
 export async function registerChartRoutes(app: FastifyInstance) {
@@ -47,6 +49,7 @@ export async function registerChartRoutes(app: FastifyInstance) {
       throw badRequest('Invalid chart range');
     }
     const requestedTimeframe = parsed.data.requestedTimeframe ?? parsed.data.timeframe;
+    const provider = resolveRequestedOhlcvProvider(parsed.data.provider) as OhlcvProviderId;
     const interactionId = request.headers['x-interaction-id']?.toString();
     const effectiveTimeframe = getEffectiveAdaptiveTimeframe({
       requestedTimeframe,
@@ -70,10 +73,12 @@ export async function registerChartRoutes(app: FastifyInstance) {
       maxProviderFetches: 1,
       interactionId,
       refreshFromMoralis: parsed.data.refreshFromMoralis ?? false,
+      provider,
     });
 
     reply.header('x-requested-timeframe', requestedTimeframe);
     reply.header('x-effective-timeframe', effectiveTimeframe);
+    reply.header('x-ohlcv-provider', provider);
     reply.header('x-cache-source', response.source);
     reply.header('x-history-complete', String(response.historyComplete));
     reply.header('x-history-warming', String(response.historyWarming));

@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 CREATE TABLE IF NOT EXISTS ohlcv_candles (
+  provider TEXT NOT NULL DEFAULT 'moralis',
   chain TEXT NOT NULL,
   pair_address TEXT NOT NULL,
   timeframe TEXT NOT NULL,
@@ -17,11 +18,11 @@ CREATE TABLE IF NOT EXISTS ohlcv_candles (
   trades INTEGER,
   source TEXT NOT NULL DEFAULT 'moralis',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (chain, pair_address, timeframe, currency, timestamp)
+  PRIMARY KEY (provider, chain, pair_address, timeframe, currency, timestamp)
 );
 
 CREATE INDEX IF NOT EXISTS ohlcv_candles_lookup_idx
-ON ohlcv_candles (chain, pair_address, timeframe, currency, timestamp DESC);
+ON ohlcv_candles (provider, chain, pair_address, timeframe, currency, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS chart_pairs (
   chain TEXT NOT NULL,
@@ -43,6 +44,7 @@ ON chart_pairs (is_hot, is_active, last_requested_at DESC);
 
 CREATE TABLE IF NOT EXISTS ohlcv_backfill_jobs (
   id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL DEFAULT 'moralis',
   queue_job_id TEXT,
   chain TEXT NOT NULL,
   pair_address TEXT NOT NULL,

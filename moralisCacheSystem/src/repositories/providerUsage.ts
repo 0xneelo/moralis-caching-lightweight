@@ -91,8 +91,8 @@ export const providerUsageRepository = {
         COALESCE(count(*) FILTER (WHERE created_at >= $1), 0)::text AS today_requests,
         COALESCE(count(*), 0)::text AS total_requests
       FROM provider_api_usage
-      WHERE provider = 'moralis'
-        AND endpoint = 'getPairCandlesticks'
+      WHERE provider IN ('moralis', 'coingecko')
+        AND endpoint IN ('getPairCandlesticks', 'poolOhlcv')
       `,
       [startOfDay]
     );
@@ -176,7 +176,7 @@ export const providerUsageRepository = {
         request_to,
         duration_ms AS detail_ms
       FROM provider_api_usage
-      WHERE provider = 'moralis'
+      WHERE provider IN ('moralis', 'coingecko')
         AND endpoint LIKE 'chartThrottle:%'
       ORDER BY created_at DESC
       LIMIT $1
@@ -214,7 +214,7 @@ export const providerUsageRepository = {
           round(avg(duration_ms))::text AS avg_duration_ms,
           count(*) FILTER (WHERE http_status >= 400)::text AS error_count
         FROM provider_api_usage
-        WHERE provider = 'moralis'
+        WHERE provider IN ('moralis', 'coingecko')
           AND created_at >= $1
         GROUP BY endpoint
         ORDER BY COALESCE(sum(estimated_cu), 0) DESC, count(*) DESC
@@ -238,7 +238,7 @@ export const providerUsageRepository = {
           max(usage.created_at) AS last_seen_at
         FROM provider_api_usage usage
         LEFT JOIN external_api_keys keys ON keys.id = usage.external_api_key_id
-        WHERE usage.provider = 'moralis'
+        WHERE usage.provider IN ('moralis', 'coingecko')
           AND usage.created_at >= $1
         GROUP BY usage.external_api_key_id, keys.name
         ORDER BY COALESCE(sum(usage.estimated_cu), 0) DESC, count(*) DESC
@@ -257,7 +257,7 @@ export const providerUsageRepository = {
           count(*)::text AS request_count,
           COALESCE(sum(estimated_cu), 0)::text AS estimated_cu
         FROM provider_api_usage
-        WHERE provider = 'moralis'
+        WHERE provider IN ('moralis', 'coingecko')
           AND created_at >= $1
         GROUP BY hour
         ORDER BY hour ASC
@@ -266,6 +266,7 @@ export const providerUsageRepository = {
       ),
       query<{
         created_at: Date;
+        provider: string;
         endpoint: string;
         external_api_key_id: string | null;
         chain: string | null;
@@ -279,6 +280,7 @@ export const providerUsageRepository = {
         `
         SELECT
           created_at,
+          provider,
           endpoint,
           external_api_key_id,
           chain,
@@ -289,7 +291,7 @@ export const providerUsageRepository = {
           pages,
           duration_ms
         FROM provider_api_usage
-        WHERE provider = 'moralis'
+        WHERE provider IN ('moralis', 'coingecko')
         ORDER BY created_at DESC
         LIMIT 100
         `
@@ -318,6 +320,7 @@ export const providerUsageRepository = {
       })),
       recent: recentResult.rows.map((row) => ({
         createdAt: row.created_at.toISOString(),
+        provider: row.provider,
         endpoint: row.endpoint,
         externalApiKeyId: row.external_api_key_id,
         chain: row.chain,

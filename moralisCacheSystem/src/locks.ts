@@ -25,6 +25,7 @@ export async function withRedisLock<T>(
 }
 
 export function buildGapFetchLockKey(params: {
+  provider: string;
   chain: string;
   pairAddress: string;
   timeframe: string;
@@ -35,6 +36,7 @@ export function buildGapFetchLockKey(params: {
   return [
     'lock',
     'ohlcv',
+    params.provider,
     params.chain,
     normalizePairAddress(params.chain, params.pairAddress),
     params.timeframe,

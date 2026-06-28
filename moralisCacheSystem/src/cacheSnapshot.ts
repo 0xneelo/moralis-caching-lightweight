@@ -25,6 +25,7 @@ export const cacheSnapshotSchema = z.object({
   sourceRuntimeMode: z.string(),
   markets: z.array(
     z.object({
+      provider: z.enum(['moralis', 'coingecko']).optional(),
       chain: z.string().min(1),
       pairAddress: z.string().min(1),
       timeframe: timeframeSchema,

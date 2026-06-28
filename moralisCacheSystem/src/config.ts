@@ -5,6 +5,22 @@ import { z } from 'zod';
 dotenv.config();
 loadRawMoralisKeyIfPresent();
 
+function booleanEnv(defaultValue: boolean) {
+  return z.preprocess((value) => {
+    if (value === undefined || value === '') {
+      return undefined;
+    }
+
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (['true', '1', 'yes'].includes(normalized)) return true;
+      if (['false', '0', 'no'].includes(normalized)) return false;
+    }
+
+    return value;
+  }, z.boolean().default(defaultValue));
+}
+
 const configSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(3001),
@@ -15,6 +31,12 @@ const configSchema = z.object({
   INTERACTION_LOG_DIR: z.string().default('logs/interactions'),
   MORALIS_API_KEY: z.string().default(''),
   MORALIS_DAILY_CU_BUDGET: z.coerce.number().int().positive().default(3_333_333),
+  OHLCV_DEFAULT_PROVIDER: z.enum(['moralis', 'coingecko']).default('moralis'),
+  COINGECKO_API_KEY: z.string().default(''),
+  COINGECKO_API_BASE_URL: z.string().url().default('https://pro-api.coingecko.com/api/v3'),
+  COINGECKO_DAILY_CREDIT_BUDGET: z.coerce.number().int().positive().default(100_000),
+  COINGECKO_MAX_SYNC_PAGES: z.coerce.number().int().positive().default(8),
+  COINGECKO_OHLCV_ENABLED: booleanEnv(true),
   DATABASE_URL: z.string().url().default('postgres://postgres:postgres@localhost:5432/moralis_cache'),
   REDIS_URL: z.string().url().default('redis://localhost:6379'),
   CHART_PROVIDER_ENABLED: z.coerce.boolean().default(true),
@@ -34,6 +56,12 @@ if (config.NODE_ENV === 'production') {
   const missingProductionSecrets = [
     ['MORALIS_API_KEY', config.MORALIS_API_KEY],
     ['ADMIN_API_KEY', config.ADMIN_API_KEY],
+    [
+      'COINGECKO_API_KEY',
+      config.OHLCV_DEFAULT_PROVIDER === 'coingecko' || config.COINGECKO_OHLCV_ENABLED
+        ? config.COINGECKO_API_KEY
+        : 'not-required',
+    ],
   ]
     .filter(([, value]) => !value)
     .map(([name]) => name);

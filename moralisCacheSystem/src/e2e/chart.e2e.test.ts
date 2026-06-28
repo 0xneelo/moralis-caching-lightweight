@@ -4,6 +4,9 @@ import type { ChartOhlcvResponse, MoralisCandle } from '../types.js';
 const state = vi.hoisted(() => {
   process.env.NODE_ENV = 'test';
   process.env.MORALIS_API_KEY = 'test-moralis-key';
+  process.env.COINGECKO_API_KEY = 'test-coingecko-key';
+  process.env.COINGECKO_OHLCV_ENABLED = 'true';
+  process.env.OHLCV_DEFAULT_PROVIDER = 'moralis';
   process.env.DATABASE_URL = 'postgres://postgres:postgres@localhost:5432/moralis_cache_test';
   process.env.REDIS_URL = 'redis://localhost:6379';
   process.env.CHART_PROVIDER_ENABLED = 'true';
@@ -22,6 +25,7 @@ const state = vi.hoisted(() => {
       }
     >(),
     candles: [] as Array<{
+      provider?: string;
       chain: string;
       pairAddress: string;
       timeframe: string;
@@ -49,6 +53,7 @@ const state = vi.hoisted(() => {
       revokedAt: Date | null;
     }>,
     moralisCalls: 0,
+    coingeckoCalls: 0,
   };
 });
 
@@ -96,6 +101,7 @@ vi.mock('../redis.js', () => {
 vi.mock('../repositories/candles.js', () => ({
   candleRepository: {
     async findCandles(params: {
+      provider?: string;
       chain: string;
       pairAddress: string;
       timeframe: string;
@@ -106,6 +112,7 @@ vi.mock('../repositories/candles.js', () => ({
       return state.candles
         .filter(
           (candle) =>
+            (candle.provider ?? 'moralis') === (params.provider ?? 'moralis') &&
             candle.chain === params.chain &&
             candle.pairAddress === params.pairAddress &&
             candle.timeframe === params.timeframe &&
@@ -116,6 +123,7 @@ vi.mock('../repositories/candles.js', () => ({
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
     },
     async findCandlesPageDesc(params: {
+      provider?: string;
       chain: string;
       pairAddress: string;
       timeframe: string;
@@ -128,6 +136,7 @@ vi.mock('../repositories/candles.js', () => ({
       return state.candles
         .filter(
           (candle) =>
+            (candle.provider ?? 'moralis') === (params.provider ?? 'moralis') &&
             candle.chain === params.chain &&
             candle.pairAddress === params.pairAddress &&
             candle.timeframe === params.timeframe &&
@@ -140,6 +149,7 @@ vi.mock('../repositories/candles.js', () => ({
         .slice(0, params.limit);
     },
     async findCountbackCandles(params: {
+      provider?: string;
       chain: string;
       pairAddress: string;
       timeframe: string;
@@ -150,6 +160,7 @@ vi.mock('../repositories/candles.js', () => ({
       return state.candles
         .filter(
           (candle) =>
+            (candle.provider ?? 'moralis') === (params.provider ?? 'moralis') &&
             candle.chain === params.chain &&
             candle.pairAddress === params.pairAddress &&
             candle.timeframe === params.timeframe &&
@@ -162,6 +173,7 @@ vi.mock('../repositories/candles.js', () => ({
         .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
     },
     async upsertCandles(params: {
+      provider?: string;
       chain: string;
       pairAddress: string;
       timeframe: string;
@@ -172,6 +184,7 @@ vi.mock('../repositories/candles.js', () => ({
         const timestamp = new Date(candle.timestamp);
         const existingIndex = state.candles.findIndex(
           (row) =>
+            (row.provider ?? 'moralis') === (params.provider ?? 'moralis') &&
             row.chain === params.chain &&
             row.pairAddress === params.pairAddress &&
             row.timeframe === params.timeframe &&
@@ -180,6 +193,7 @@ vi.mock('../repositories/candles.js', () => ({
         );
 
         const row = {
+          provider: params.provider ?? 'moralis',
           chain: params.chain,
           pairAddress: params.pairAddress,
           timeframe: params.timeframe,
@@ -235,8 +249,8 @@ vi.mock('../repositories/providerUsage.js', () => ({
 
 vi.mock('../repositories/marketHistoryState.js', () => ({
   marketHistoryStateRepository: {
-    async get(params: { chain: string; pairAddress: string; timeframe: string; currency: string }) {
-      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+    async get(params: { provider?: string; chain: string; pairAddress: string; timeframe: string; currency: string }) {
+      const key = [params.provider ?? 'moralis', params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
       const stateEntry = state.marketHistoryState.get(key);
       if (!stateEntry) {
         return null;
@@ -257,8 +271,8 @@ vi.mock('../repositories/marketHistoryState.js', () => ({
         updatedAt: new Date('2026-04-28T00:00:00.000Z'),
       };
     },
-    async markQueued(params: { chain: string; pairAddress: string; timeframe: string; currency: string }) {
-      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+    async markQueued(params: { provider?: string; chain: string; pairAddress: string; timeframe: string; currency: string }) {
+      const key = [params.provider ?? 'moralis', params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
       const existing = state.marketHistoryState.get(key);
       state.marketHistoryState.set(key, {
         fullHistoryStatus: 'queued',
@@ -266,8 +280,8 @@ vi.mock('../repositories/marketHistoryState.js', () => ({
         latestSyncedTs: existing?.latestSyncedTs ?? null,
       });
     },
-    async markRunning(params: { chain: string; pairAddress: string; timeframe: string; currency: string }) {
-      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+    async markRunning(params: { provider?: string; chain: string; pairAddress: string; timeframe: string; currency: string }) {
+      const key = [params.provider ?? 'moralis', params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
       const existing = state.marketHistoryState.get(key);
       state.marketHistoryState.set(key, {
         fullHistoryStatus: 'running',
@@ -276,6 +290,7 @@ vi.mock('../repositories/marketHistoryState.js', () => ({
       });
     },
     async markCompleted(params: {
+      provider?: string;
       chain: string;
       pairAddress: string;
       timeframe: string;
@@ -283,15 +298,15 @@ vi.mock('../repositories/marketHistoryState.js', () => ({
       marketStartTs: Date | null;
       latestSyncedTs: Date | null;
     }) {
-      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+      const key = [params.provider ?? 'moralis', params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
       state.marketHistoryState.set(key, {
         fullHistoryStatus: 'complete',
         marketStartTs: params.marketStartTs,
         latestSyncedTs: params.latestSyncedTs,
       });
     },
-    async markFailed(params: { chain: string; pairAddress: string; timeframe: string; currency: string }) {
-      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+    async markFailed(params: { provider?: string; chain: string; pairAddress: string; timeframe: string; currency: string }) {
+      const key = [params.provider ?? 'moralis', params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
       const existing = state.marketHistoryState.get(key);
       state.marketHistoryState.set(key, {
         fullHistoryStatus: 'failed',
@@ -300,6 +315,7 @@ vi.mock('../repositories/marketHistoryState.js', () => ({
       });
     },
     async upsertBoundsFromCandles(params: {
+      provider?: string;
       chain: string;
       pairAddress: string;
       timeframe: string;
@@ -307,7 +323,7 @@ vi.mock('../repositories/marketHistoryState.js', () => ({
       candles: Array<{ timestamp: string }>;
     }) {
       if (params.candles.length === 0) return;
-      const key = [params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
+      const key = [params.provider ?? 'moralis', params.chain, params.pairAddress, params.timeframe, params.currency].join(':');
       const timestamps = params.candles.map((candle) => new Date(candle.timestamp).getTime());
       const min = new Date(Math.min(...timestamps));
       const max = new Date(Math.max(...timestamps));
@@ -432,6 +448,48 @@ vi.mock('../moralis.js', () => ({
   assertMoralisOhlcvEnabled: vi.fn(async () => undefined),
 }));
 
+vi.mock('../providers/ohlcv/coingeckoProvider.js', () => ({
+  coingeckoOhlcvProvider: {
+    id: 'coingecko',
+    endpoint: 'poolOhlcv',
+    fetchOhlcv: vi.fn(async () => {
+      state.coingeckoCalls += 1;
+
+      return {
+        candles: [
+          {
+            timestamp: '2026-04-28T00:00:00.000Z',
+            open: 10,
+            high: 12,
+            low: 9,
+            close: 11,
+            volume: 1000,
+          },
+          {
+            timestamp: '2026-04-28T01:00:00.000Z',
+            open: 11,
+            high: 14,
+            low: 10,
+            close: 13,
+            volume: 1500,
+          },
+        ],
+        pages: 1,
+        estimatedCu: 1,
+        durationMs: 15,
+        truncated: false,
+      };
+    }),
+  },
+  fetchCoinGeckoOhlcv: vi.fn(async () => ({
+    candles: [],
+    pages: 0,
+    estimatedCu: 0,
+    durationMs: 0,
+    truncated: false,
+  })),
+}));
+
 describe('chart API E2E', () => {
   beforeEach(() => {
     state.redisStore.clear();
@@ -441,6 +499,7 @@ describe('chart API E2E', () => {
     state.backfillJobs.length = 0;
     state.apiKeys.length = 0;
     state.moralisCalls = 0;
+    state.coingeckoCalls = 0;
   });
 
   it('fetches missing candles once, stores them, and serves repeat requests from cache', async () => {
@@ -598,6 +657,71 @@ describe('chart API E2E', () => {
     ]);
     expect(state.moralisCalls).toBe(2);
     expect(state.apiKeys[0]?.requestCount).toBe(2);
+
+    await app.close();
+  });
+
+  it('serves CoinGecko-selected OHLCV without mixing Moralis cache rows', async () => {
+    const { buildServer } = await import('../server.js');
+    const app = await buildServer();
+
+    const createKeyResponse = await app.inject({
+      method: 'POST',
+      url: '/api/admin/api-keys',
+      headers: {
+        authorization: 'Bearer test-admin-key',
+      },
+      payload: {
+        name: 'coingecko requester',
+      },
+    });
+    const createdKey = createKeyResponse.json<{ apiKey: string }>();
+    const pairAddress = '0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640';
+
+    state.candles.push({
+      provider: 'moralis',
+      chain: 'eth',
+      pairAddress,
+      timeframe: '1h',
+      currency: 'usd',
+      timestamp: new Date('2026-04-28T01:00:00.000Z'),
+      open: '1.5',
+      high: '2.5',
+      low: '1.4',
+      close: '2',
+      volume: '150',
+      trades: 12,
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url:
+        `/api/v2.2/pairs/${pairAddress}/ohlcv?` +
+        new URLSearchParams({
+          chain: 'eth',
+          timeframe: '1h',
+          currency: 'usd',
+          fromDate: '2026-04-28T00:00:00.000Z',
+          toDate: '2026-04-28T02:00:00.000Z',
+          limit: '2',
+          provider: 'coingecko',
+        }).toString(),
+      headers: {
+        'x-api-key': createdKey.apiKey,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['x-ohlcv-provider']).toBe('coingecko');
+    expect(response.headers['x-cache-source']).toBe('cache+coingecko');
+    expect(response.headers['x-provider-cost-used']).toBe('1');
+    expect(state.moralisCalls).toBe(0);
+    expect(state.coingeckoCalls).toBe(1);
+
+    const body = response.json<{ result: Array<{ timestamp: string; close: number }> }>();
+    expect(body.result.map((candle) => candle.close)).toEqual([13, 11]);
+    expect(state.candles.filter((candle) => candle.provider === 'moralis')).toHaveLength(1);
+    expect(state.candles.filter((candle) => candle.provider === 'coingecko')).toHaveLength(2);
 
     await app.close();
   });

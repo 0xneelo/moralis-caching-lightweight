@@ -1,15 +1,15 @@
 # Moralis Cache System
 
-Backend OHLC cache service for reducing Moralis chart costs.
+Backend OHLC cache service for reducing chart-provider costs.
 
-The service stores historical candles in TimescaleDB/Postgres, uses Redis for hot cache/locks/rate limits, calls Moralis only for missing ranges, and queues large backfills through BullMQ.
+The service stores historical candles in TimescaleDB/Postgres, uses Redis for hot cache/locks/rate limits, calls Moralis or CoinGecko only for missing ranges, and queues large backfills through BullMQ.
 
 ## What This Solves
 
 The frontend must not call Moralis directly. Users should call this service:
 
 ```text
-Frontend -> /api/charts/ohlcv -> Redis/DB -> Moralis only for missing ranges
+Frontend -> /api/charts/ohlcv?provider=moralis|coingecko -> Redis/DB -> selected provider only for missing ranges
 ```
 
 This prevents repeated full-history OHLC requests when users open charts or switch timeframes.
@@ -19,6 +19,7 @@ This prevents repeated full-history OHLC requests when users open charts or swit
 - Node.js 22+
 - Docker Desktop
 - Moralis API key in `.env`
+- CoinGecko Pro API key in `.env` when `provider=coingecko` is enabled
 
 ## Environment
 
@@ -26,13 +27,16 @@ You already added `.env`. It should contain at least:
 
 ```env
 MORALIS_API_KEY=your-key
+OHLCV_DEFAULT_PROVIDER=moralis
+COINGECKO_API_KEY="your-coingecko-pro-key"
+COINGECKO_OHLCV_ENABLED=true
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/moralis_cache
 REDIS_URL=redis://localhost:6379
 PORT=3001
 ADMIN_API_KEY=change-me
 ```
 
-Do not expose `MORALIS_API_KEY` to frontend env vars.
+Do not expose `MORALIS_API_KEY` or `COINGECKO_API_KEY` to frontend env vars.
 
 ## Setup
 
@@ -158,7 +162,7 @@ GET /health
 ### Get Chart Candles
 
 ```http
-GET /api/charts/ohlcv?chain=eth&pairAddress=0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640&timeframe=1h&currency=usd&from=2026-04-01T00:00:00.000Z&to=2026-04-28T00:00:00.000Z
+GET /api/charts/ohlcv?chain=eth&pairAddress=0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640&timeframe=1h&currency=usd&from=2026-04-01T00:00:00.000Z&to=2026-04-28T00:00:00.000Z&provider=coingecko
 ```
 
 Response:
@@ -171,7 +175,7 @@ Response:
   "currency": "usd",
   "from": "2026-04-01T00:00:00.000Z",
   "to": "2026-04-28T00:00:00.000Z",
-  "source": "cache+moralis",
+  "source": "cache+coingecko",
   "partial": false,
   "candles": []
 }
@@ -179,17 +183,17 @@ Response:
 
 ### Moralis-Compatible OHLCV
 
-External frontends can point their Moralis-style client at this service and keep the same OHLCV request syntax. They only need to change the base URL and use one of the generated API keys:
+External frontends can point their Moralis-style client at this service and keep the same OHLCV request syntax. They only need to change the base URL and use one of the generated API keys. Add `provider=moralis` or `provider=coingecko` to choose the upstream provider per request; if omitted, the service uses `OHLCV_DEFAULT_PROVIDER`.
 
 ```http
-GET /api/v2.2/pairs/0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640/ohlcv?chain=eth&timeframe=1h&currency=usd&fromDate=2026-04-01T00:00:00.000Z&toDate=2026-04-28T00:00:00.000Z&limit=1000
+GET /api/v2.2/pairs/0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640/ohlcv?chain=eth&timeframe=1h&currency=usd&fromDate=2026-04-01T00:00:00.000Z&toDate=2026-04-28T00:00:00.000Z&limit=1000&provider=coingecko
 X-API-Key: mcs_live_generated_key
 ```
 
 Solana-compatible path:
 
 ```http
-GET /token/mainnet/pairs/PAIR_ADDRESS/ohlcv?timeframe=1h&currency=usd&fromDate=2026-04-01T00:00:00.000Z&toDate=2026-04-28T00:00:00.000Z&limit=1000
+GET /token/mainnet/pairs/PAIR_ADDRESS/ohlcv?timeframe=1h&currency=usd&fromDate=2026-04-01T00:00:00.000Z&toDate=2026-04-28T00:00:00.000Z&limit=1000&provider=coingecko
 X-API-Key: mcs_live_generated_key
 ```
 
@@ -280,13 +284,13 @@ Authorization: Bearer change-me
 
 ## Cost Controls
 
-- Max synchronous Moralis pages defaults to `8`.
+- Max synchronous Moralis pages defaults to `8`; CoinGecko pages default to `8`.
 - Large gaps are queued instead of fetched synchronously.
 - Redis locks dedupe concurrent provider fetches.
 - Chart requests are rate-limited by user/IP.
 - Provider cache misses are rate-limited separately.
-- Estimated Moralis CUs are logged in `provider_api_usage`.
-- Daily CU budget guard defaults to `3,333,333`.
+- Estimated provider cost is logged in `provider_api_usage.estimated_cu`.
+- Moralis daily CU budget defaults to `3,333,333`; CoinGecko daily credit budget defaults to `100,000`.
 
 ## Useful Commands
 

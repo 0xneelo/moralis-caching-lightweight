@@ -1,10 +1,11 @@
 import type { PoolClient } from 'pg';
 import { CACHE_SNAPSHOT_FORMAT, type CacheSnapshot } from '../cacheSnapshot.js';
-import { query, transaction } from '../db.js';
-import type { MoralisCandle, OhlcvCurrency, OhlcvTimeframe, StoredCandle } from '../types.js';
+import { query } from '../db.js';
+import type { MoralisCandle, OhlcvCurrency, OhlcvProviderId, OhlcvTimeframe, StoredCandle } from '../types.js';
 
 const upsertCandleSql = `
 INSERT INTO ohlcv_candles (
+  provider,
   chain,
   pair_address,
   timeframe,
@@ -19,9 +20,9 @@ INSERT INTO ohlcv_candles (
   source,
   updated_at
 ) VALUES (
-  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'moralis', now()
+  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $1, now()
 )
-ON CONFLICT (chain, pair_address, timeframe, currency, timestamp)
+ON CONFLICT (provider, chain, pair_address, timeframe, currency, timestamp)
 DO UPDATE SET
   open = EXCLUDED.open,
   high = EXCLUDED.high,
@@ -35,6 +36,7 @@ DO UPDATE SET
 
 export const candleRepository = {
   async findCandles(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -46,15 +48,17 @@ export const candleRepository = {
       `
       SELECT timestamp, open, high, low, close, volume, trades
       FROM ohlcv_candles
-      WHERE chain = $1
-        AND pair_address = $2
-        AND timeframe = $3
-        AND currency = $4
-        AND timestamp >= $5
-        AND timestamp <= $6
+      WHERE provider = $1
+        AND chain = $2
+        AND pair_address = $3
+        AND timeframe = $4
+        AND currency = $5
+        AND timestamp >= $6
+        AND timestamp <= $7
       ORDER BY timestamp ASC
       `,
       [
+        params.provider,
         params.chain,
         params.pairAddress,
         params.timeframe,
@@ -68,6 +72,7 @@ export const candleRepository = {
   },
 
   async upsertCandles(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -85,8 +90,9 @@ export const candleRepository = {
       const values: unknown[] = [];
       const placeholders = chunk.map((candle, index) => {
         const normalized = normalizeMoralisCandle(candle);
-        const base = index * 11;
+        const base = index * 12;
         values.push(
+          params.provider,
           params.chain,
           params.pairAddress,
           params.timeframe,
@@ -99,12 +105,13 @@ export const candleRepository = {
           normalized.volume ?? null,
           normalized.trades ?? null
         );
-        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11}, 'moralis', now())`;
+        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11}, $${base + 12}, $${base + 1}, now())`;
       });
 
       await query(
         `
         INSERT INTO ohlcv_candles (
+          provider,
           chain,
           pair_address,
           timeframe,
@@ -119,7 +126,7 @@ export const candleRepository = {
           source,
           updated_at
         ) VALUES ${placeholders.join(',')}
-        ON CONFLICT (chain, pair_address, timeframe, currency, timestamp)
+        ON CONFLICT (provider, chain, pair_address, timeframe, currency, timestamp)
         DO UPDATE SET
           open = EXCLUDED.open,
           high = EXCLUDED.high,
@@ -138,6 +145,7 @@ export const candleRepository = {
   },
 
   async getBounds(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -152,12 +160,13 @@ export const candleRepository = {
         MIN(timestamp) AS min_timestamp,
         MAX(timestamp) AS max_timestamp
       FROM ohlcv_candles
-      WHERE chain = $1
-        AND pair_address = $2
-        AND timeframe = $3
-        AND currency = $4
+      WHERE provider = $1
+        AND chain = $2
+        AND pair_address = $3
+        AND timeframe = $4
+        AND currency = $5
       `,
-      [params.chain, params.pairAddress, params.timeframe, params.currency]
+      [params.provider, params.chain, params.pairAddress, params.timeframe, params.currency]
     );
 
     const row = result.rows[0];
@@ -168,6 +177,7 @@ export const candleRepository = {
   },
 
   async findCandlesPageDesc(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -182,17 +192,19 @@ export const candleRepository = {
       `
       SELECT timestamp, open, high, low, close, volume, trades
       FROM ohlcv_candles
-      WHERE chain = $1
-        AND pair_address = $2
-        AND timeframe = $3
-        AND currency = $4
-        AND timestamp >= $5
-        AND timestamp <= $6
-        AND ($7::timestamptz IS NULL OR timestamp < $7)
+      WHERE provider = $1
+        AND chain = $2
+        AND pair_address = $3
+        AND timeframe = $4
+        AND currency = $5
+        AND timestamp >= $6
+        AND timestamp <= $7
+        AND ($8::timestamptz IS NULL OR timestamp < $8)
       ORDER BY timestamp DESC
-      LIMIT $8
+      LIMIT $9
       `,
       [
+        params.provider,
         params.chain,
         params.pairAddress,
         params.timeframe,
@@ -208,6 +220,7 @@ export const candleRepository = {
   },
 
   async findCountbackCandles(params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -222,18 +235,20 @@ export const candleRepository = {
       FROM (
         SELECT timestamp, open, high, low, close, volume, trades
         FROM ohlcv_candles
-        WHERE chain = $1
-          AND pair_address = $2
-          AND timeframe = $3
-          AND currency = $4
-          AND timestamp <= $5
+        WHERE provider = $1
+          AND chain = $2
+          AND pair_address = $3
+          AND timeframe = $4
+          AND currency = $5
+          AND timestamp <= $6
           AND COALESCE(volume, 0) > 0
         ORDER BY timestamp DESC
-        LIMIT $6
+        LIMIT $7
       ) latest
       ORDER BY timestamp ASC
       `,
       [
+        params.provider,
         params.chain,
         params.pairAddress,
         params.timeframe,
@@ -249,6 +264,7 @@ export const candleRepository = {
   async getInventory(params?: { limit?: number | undefined }) {
     const limit = Math.max(1, Math.min(500, params?.limit ?? 100));
     const result = await query<{
+      provider: OhlcvProviderId;
       chain: string;
       pair_address: string;
       timeframe: OhlcvTimeframe;
@@ -260,6 +276,7 @@ export const candleRepository = {
     }>(
       `
       SELECT
+        provider,
         chain,
         pair_address,
         timeframe,
@@ -269,7 +286,7 @@ export const candleRepository = {
         max(timestamp) AS last_candle_at,
         max(updated_at) AS updated_at
       FROM ohlcv_candles
-      GROUP BY chain, pair_address, timeframe, currency
+      GROUP BY provider, chain, pair_address, timeframe, currency
       ORDER BY max(updated_at) DESC
       LIMIT $1
       `,
@@ -277,6 +294,7 @@ export const candleRepository = {
     );
 
     return result.rows.map((row) => ({
+      provider: row.provider,
       chain: row.chain,
       pairAddress: row.pair_address,
       timeframe: row.timeframe,
@@ -290,6 +308,7 @@ export const candleRepository = {
 
   async exportSnapshot(sourceRuntimeMode: string): Promise<CacheSnapshot> {
     const result = await query<{
+      provider: OhlcvProviderId;
       chain: string;
       pair_address: string;
       timeframe: OhlcvTimeframe;
@@ -304,6 +323,7 @@ export const candleRepository = {
     }>(
       `
       SELECT
+        provider,
         chain,
         pair_address,
         timeframe,
@@ -316,17 +336,18 @@ export const candleRepository = {
         volume,
         trades
       FROM ohlcv_candles
-      ORDER BY chain, pair_address, timeframe, currency, timestamp ASC
+      ORDER BY provider, chain, pair_address, timeframe, currency, timestamp ASC
       `
     );
 
     const markets = new Map<string, CacheSnapshot['markets'][number]>();
 
     for (const row of result.rows) {
-      const key = [row.chain, row.pair_address, row.timeframe, row.currency].join(':');
+      const key = [row.provider, row.chain, row.pair_address, row.timeframe, row.currency].join(':');
       const market =
         markets.get(key) ??
         {
+          provider: row.provider,
           chain: row.chain,
           pairAddress: row.pair_address,
           timeframe: row.timeframe,
@@ -359,6 +380,7 @@ export const candleRepository = {
 
     for (const market of snapshot.markets) {
       const result = await this.upsertCandles({
+        provider: market.provider ?? 'moralis',
         chain: market.chain,
         pairAddress: market.pairAddress,
         timeframe: market.timeframe,
@@ -379,6 +401,7 @@ export const candleRepository = {
 async function upsertOne(
   client: PoolClient,
   params: {
+    provider: OhlcvProviderId;
     chain: string;
     pairAddress: string;
     timeframe: OhlcvTimeframe;
@@ -389,6 +412,7 @@ async function upsertOne(
   const normalized = normalizeMoralisCandle(candle);
 
   await client.query(upsertCandleSql, [
+    params.provider,
     params.chain,
     params.pairAddress,
     params.timeframe,

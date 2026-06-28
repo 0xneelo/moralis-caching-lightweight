@@ -10,6 +10,7 @@ import { redis } from '../redis.js';
 import { candleRepository } from '../repositories/candles.js';
 import { externalApiKeyRepository } from '../repositories/externalApiKeys.js';
 import { providerUsageRepository } from '../repositories/providerUsage.js';
+import { resolveRequestedOhlcvProvider } from '../providers/ohlcv/registry.js';
 import { isOhlcvTimeframe } from '../timeframes.js';
 import type { OhlcvTimeframe } from '../types.js';
 
@@ -27,6 +28,7 @@ const backfillBodySchema = z.object({
   from: z.string().datetime(),
   to: z.string().datetime(),
   priority: z.enum(['low', 'normal', 'high']).default('normal'),
+  provider: z.enum(['moralis', 'coingecko']).optional(),
 });
 
 const createApiKeyBodySchema = z.object({
@@ -171,6 +173,7 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     for (const timeframe of parsed.data.timeframes) {
       jobs.push(
         await enqueueBackfillJob({
+          provider: resolveRequestedOhlcvProvider(parsed.data.provider),
           chain: parsed.data.chain,
           pairAddress: normalizePairAddress(parsed.data.chain, parsed.data.pairAddress),
           timeframe,

@@ -588,8 +588,9 @@ function CachePage({
           </div>
         ) : (
           <DataTable
-            columns={['Chain', 'Pair', 'Timeframe', 'Candles', 'Coverage', 'Updated']}
+            columns={['Provider', 'Chain', 'Pair', 'Timeframe', 'Candles', 'Coverage', 'Updated']}
             rows={data.cacheInventory.map((market) => [
+              market.provider ?? 'moralis',
               market.chain,
               shorten(market.pairAddress),
               `${market.timeframe} ${market.currency}`,

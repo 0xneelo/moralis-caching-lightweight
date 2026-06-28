@@ -2,6 +2,7 @@ import { redis } from './redis.js';
 import { tooManyRequests } from './httpErrors.js';
 import { getAdminSettings } from './adminConfig.js';
 import { providerUsageRepository } from './repositories/providerUsage.js';
+import type { OhlcvProviderId } from './types.js';
 
 export async function enforceChartRateLimit(params: {
   userId?: string | undefined;
@@ -57,13 +58,14 @@ export async function enforceExternalApiKeyCacheMissRateLimit(params: { apiKeyId
 }
 
 export async function assertExternalApiKeyCuBudgetAvailable(params: {
+  provider: OhlcvProviderId;
   apiKeyId: string;
   estimatedCu: number;
 }) {
   const now = new Date();
   const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   const usedToday = await providerUsageRepository.sumEstimatedCu({
-    provider: 'moralis',
+    provider: params.provider,
     from: startOfDay,
     to: now,
     externalApiKeyId: params.apiKeyId,
